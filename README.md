@@ -19,6 +19,6 @@ AI use: Yes this is ai, but NOT a slop core, this uses mostly human modules (Arl
   </table>
 </p>
 
-Credits: Clyde Shaffer for Gametank itself and docs. Arlet Ottens and Anders for the 6502 cpu. [Nikiiv for the MiSTer core (https://github.com/nikiiv/GameTank_MiSTer)]([url](https://github.com/nikiiv/GameTank_MiSTer)) and many more.
+Credits: Clyde Shaffer for Gametank itself and docs. Arlet Ottens and Anders for the 6502 cpu. [Nikiiv for the MiSTer core ([url](https://github.com/nikiiv/GameTank_MiSTer)) and many more.
 
 Licenses: I am not a lawyer, but some components of this used GPLv3 and that is why this is GPLv3
