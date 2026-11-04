@@ -87,10 +87,20 @@ input   wire            target_dataslot_read,       // rising edge triggered
 input   wire            target_dataslot_write,
 input   wire            target_dataslot_getfile,
 input   wire            target_dataslot_openfile,
+// 0x0188 Data slot flush. NOT USED BY THE FRAMEWORK'S OWN WRITEBACK PATH:
+// a file the core wrote with 0x0184 is only guaranteed to be on the card
+// after this, because the host buffers it (see rtl/gt_save_file.sv).
+input   wire            target_dataslot_flush,
 
 output  reg             target_dataslot_ack,        // asserted upon command start until completion
 output  reg             target_dataslot_done,       // asserted upon command finish until next command is issued
 output  reg     [2:0]   target_dataslot_err,        // contains result of command execution. zero is OK
+
+// 0x0188 record. `seen` says the host answered the last flush; when it is 0
+// the flush was sent and nothing came back, which is a fact about the
+// firmware and not about the file (see TARG_ST_WAITRESULT_DSO).
+output  reg             target_dataslot_flush_seen,
+output  reg     [2:0]   target_dataslot_flush_result,
 
 input   wire    [15:0]  target_dataslot_id,         // parameters for each of the read/reload/write commands
 input   wire    [31:0]  target_dataslot_slotoffset,
@@ -165,6 +175,28 @@ localparam  [3:0]   ST_DONE_CODE    = 'd14;
 localparam  [3:0]   ST_DONE_ERR     = 'd15;
     reg     [3:0]   hstate;
 
+/* NO HOST COMMAND MAY GO UNANSWERED (2026-11-02).
+ *
+ * Every branch of `ST_PARSE` below can wait for something the CORE has to
+ * produce: `[0080]`/`[0082]` for the slot handshake, `[00A0]`/`[00A4]` for a
+ * savestate engine. The OS, meanwhile, is parked in the middle of one bridge
+ * transaction until the reply word lands, and it does not time it out.
+ *
+ * A quit is exactly this sequence: `[0010 Reset Enter]`, then `[0080]` for the
+ * nonvolatile slot, then `[008F]`, then the menu. So one reply that never comes
+ * is a Pocket that sits on a black screen until it is power-cycled -- which is
+ * the panel's own description of this core's quit, and the reason the `.sav` is
+ * never written: the OS never gets as far as the write-back.
+ *
+ * The deadline is 2^22 clk_74a, 57 ms. The slowest thing a command waits on is
+ * a savestate capture; the data-slot handshake has its own 0.88 ms cap. 57 ms is
+ * far longer than any of them and far shorter than a person notices, so a real
+ * answer always wins and the timeout only fires for an answer that was never
+ * coming. On expiry the command is answered as if it had succeeded: a shutdown
+ * that reads out a stale window still writes a file, and a file beats a hang. */
+localparam  [22:0]  HOST_WD_MAX     = 23'h3F_FFFF;
+    reg     [22:0]  hstate_wd;
+
 // target
 
     reg     [31:0]  target_0;
@@ -188,11 +220,110 @@ localparam  [3:0]   TARG_ST_WAITRESULT_RTR  = 'd14;
 localparam  [3:0]   TARG_ST_WAITRESULT_DSO  = 'd15;
     reg     [3:0]   tstate;
 
+/* A TARGET COMMAND THE HOST NEVER ANSWERS MUST NOT WEDGE THE CHANNEL
+ * (2026-11-02).
+ *
+ * `TARG_ST_WAITRESULT_DSO` has no exit but the host writing "ok" into
+ * `target_0`. Every core derived from this template gets away with it because
+ * none of them issues target commands; this one does (rtl/gt_save_file.sv), and
+ * the host does not answer them while it is busy elsewhere -- in particular
+ * while its own menu is up, which is the moment a quit begins. A command that
+ * goes unanswered there leaves the framework in that state for the rest of the
+ * session: `target_0` keeps the "cm" marker of a command the host never ran, no
+ * later command is ever issued, and the core spends the shutdown looking like
+ * it is in the middle of a transfer. That is a core the OS cannot close
+ * cleanly.
+ *
+ * 2^26 clk_74a is 0.90 s. The longest command this core issues reads 1,920
+ * bytes across the bridge, about 0.4 ms, so this is two thousand times the work
+ * it is protecting -- and it is short enough that a quit is never held up by
+ * more than the timeout. On expiry the command is dropped exactly as a failed
+ * one is: `target_dataslot_done` with error 5, so the module that asked for it
+ * gives up instead of waiting for a `done` that is not coming. */
+localparam  [26:0]  TARG_WD_MAX      = 27'h400_0000;
+
+/* 0x0188 IS NOT WAITED ON LIKE THE OTHERS (2026-11-01).
+ *
+ * The documented reply to a flush is `ok` with "all bytes written ok", and on
+ * a real card a flush is also where the host updates the file's length on SD,
+ * so it can legitimately take seconds. Both the reference dumper and this core
+ * have only ever seen it go unanswered, and a command that is still
+ * outstanding blocks every target command after it -- including the one that
+ * hands the data slot back, which must happen or the shutdown writeback lands
+ * on the file that was just written.
+ *
+ * So a flush is fired into a fixed 0.23 s window and nothing waits on it: a
+ * reply that arrives inside the window is recorded, and one that does not is
+ * forgotten. The window is also a settle period -- `target_0` is cleared on the
+ * way out, so a reply arriving late cannot be read as the result of whatever
+ * command comes next. */
+localparam  [26:0]  FLUSH_WD         = 27'h100_0000;
+    reg     [26:0]  targ_wd;
+    reg             flushing = 1'b0;
+
+/* THE HOST SAYS GOODBYE TWICE BEFORE `reset_n` EVER DROPS (2026-11-02).
+ *
+ * The block below abandons an in-flight target command when the host resets
+ * us, and on the panel that was still one command too late. "Exiting the core
+ * goes black and I have to power cycle" is the framework closing while a `cm`
+ * marker is standing in target_0: the OS has already stopped running target
+ * commands, the marker never clears, and the core it is trying to unload looks
+ * like it is mid-transfer forever.
+ *
+ * `reset_n` is not the first goodbye. Before it the host does two things this
+ * core can see, and each means the same thing -- "I am not servicing you now":
+ *
+ *   * the menu opens (`osnotify_inmenu`, [00B0]). Quit is chosen from that
+ *     menu, so this is the last moment before a shutdown. It is also the state
+ *     the reference dumper's 1.8 s settle exists for;
+ *   * the data-slot phase ends (`dataslot_allcomplete`, [008F]). The OS sends
+ *     it when it has finished with every slot, which at a shutdown is right
+ *     after it has read the Save slot out.
+ *
+ * Both are taken on the RISING EDGE, not the level. `allcomplete` stays high
+ * for the rest of the session after an ordinary load, and treating that as an
+ * abort would kill the next command the save writer issues. A rising edge is
+ * the event; the level is just the state afterwards.
+ *
+ * The result is the same as the reset path: the marker is cleared, the issuer
+ * is told nobody answered (error 7), and the block returns to idle. Nothing is
+ * left for the framework to wait on. */
+    reg             dso_q    = 1'b0;
+    reg             inmenu_q = 1'b0;
+
+    /* THE ABORT IS ONLY EVER THIS CORE'S OWN COMMANDS (2026-11-02).
+     *
+     * It was every state, and that is a launch that cannot start. The two
+     * commands above are ours -- `[0180`/`[0184`/`[0190`/`[0192`, issued by
+     * rtl/gt_save_file.sv. The other two are the FRAMEWORK's:
+     * `TARG_ST_READYTORUN`/`TARG_ST_WAITRESULT_RTR` are the `cm 0140` that tells
+     * Analogue OS this core is ready to run.
+     *
+     * `dataslot_allcomplete` is `[008F`, and the OS sends it when it has finished
+     * with every data slot -- at a LAUNCH that is after the cartridge and the
+     * save have both landed, which is after `status_setup_done` has already put
+     * the ready-to-run marker into `target_0`. So on every launch the abort fired
+     * on the marker, cleared `target_0`, and the framework had nothing left to
+     * run: "error in framework: core not ready to run", and the core never
+     * starts. That is the panel's report, word for word, and it is new with this
+     * abort.
+     *
+     * The note at TARG_WD_MAX above records the same failure from the watchdog's
+     * side a day earlier -- the ready-to-run marker is the one thing in this file
+     * that must never be withdrawn, by any mechanism. So the abort is gated to
+     * the states where the command really is ours and really can be abandoned. */
+    wire            targ_cmd_mine = (tstate == TARG_ST_DATASLOTOP) ||
+                                    (tstate == TARG_ST_WAITRESULT_DSO);
+    wire            targ_abort = targ_cmd_mine &&
+                                 ((dataslot_allcomplete & ~dso_q) |
+                                  (osnotify_inmenu     & ~inmenu_q));
+
     reg             status_setup_done_1, status_setup_done_queue;
     reg             target_dataslot_read_1, target_dataslot_read_queue;
     reg             target_dataslot_write_1, target_dataslot_write_queue;
     reg             target_dataslot_getfile_1, target_dataslot_getfile_queue;
     reg             target_dataslot_openfile_1, target_dataslot_openfile_queue;
+    reg             target_dataslot_flush_1, target_dataslot_flush_queue;
 
 // Power-up value of reset_n: ONE.
 //
@@ -242,9 +373,11 @@ initial begin
     target_dataslot_write_queue <= 0;
     target_dataslot_getfile_queue <= 0;
     target_dataslot_openfile_queue <= 0;
+    target_dataslot_flush_queue <= 0;
     target_dataslot_ack <= 0;
     target_dataslot_done <= 0;
     target_dataslot_err <= 0;
+    targ_wd <= 0;
 end
 
 always @(posedge clk) begin
@@ -256,6 +389,7 @@ always @(posedge clk) begin
     target_dataslot_write_1 <= target_dataslot_write;
     target_dataslot_getfile_1 <= target_dataslot_getfile;
     target_dataslot_openfile_1 <= target_dataslot_openfile;
+    target_dataslot_flush_1 <= target_dataslot_flush;
 
     if(status_setup_done & ~status_setup_done_1) begin
         status_setup_done_queue <= 1;
@@ -271,6 +405,9 @@ always @(posedge clk) begin
     end
     if(target_dataslot_openfile & ~target_dataslot_openfile_1) begin
         target_dataslot_openfile_queue <= 1;
+    end
+    if(target_dataslot_flush & ~target_dataslot_flush_1) begin
+        target_dataslot_flush_queue <= 1;
     end
 
     b_datatable_wren <= 0;
@@ -347,6 +484,11 @@ always @(posedge clk) begin
 
 
     // host > target command executer
+    if (hstate == ST_PARSE) begin
+        if (hstate_wd != HOST_WD_MAX) hstate_wd <= hstate_wd + 23'd1;
+    end else
+        hstate_wd <= 23'd0;
+
     case(hstate)
     ST_IDLE: begin
 
@@ -370,7 +512,11 @@ always @(posedge clk) begin
         // overwrite command semaphore with busy flag
         host_0 <= {16'h4255, host_cmd};
 
-        case(host_cmd)
+        if (hstate_wd == HOST_WD_MAX) begin
+            /* THE DEADLINE PASSED. Answer, do not wait. (see HOST_WD_MAX) */
+            host_resultcode <= 16'h0000;
+            hstate          <= ST_DONE_CODE;
+        end else case(host_cmd)
         16'h0000: begin
             // Request Status
             host_resultcode <= 1; // default: booting
@@ -488,6 +634,35 @@ always @(posedge clk) begin
             osnotify_pause_req  <= host_20[1];
             hstate <= ST_DONE_OK;
         end
+        16'h00B1: begin
+            // OS Notify: Cartridge Adapter. The Pocket sends this on EVERY
+            // boot -- "will always be sent", per the command reference -- and
+            // this core has no adapter to switch to. Answering it is the
+            // difference between a documented no-op and an unknown-command
+            // error (0xFFFF) sitting in the OS's command log on every launch.
+            hstate <= ST_DONE_OK;
+        end
+        16'h00B2: begin
+            // OS Notify: Docked State. Same shape: nothing here changes, but
+            // the OS is told the core took it.
+            hstate <= ST_DONE_OK;
+        end
+        16'h00B8: begin
+            // OS Notify: Display Mode. RESPONSE: ONE WORD, and 16'h444D is
+            // what lets a grayscale-only (LCD) mode be used at all -- the OS
+            // refuses the mode if it cannot read that back. This core's picture
+            // is already 24-bit colour with no dithering, so it can honestly
+            // affirm grayscale by passing the colour channels through: the
+            // response says "yes", which is true.
+            //
+            // The word goes in the command block's response area, 0x40, which
+            // is also where 0x00A0 puts its `can create` bit. That is safe in
+            // both directions: 0x00A0 and 0x00A4 rewrite 0x40 unconditionally
+            // on every query, and 0x444D has bit 0 set, so even a stale value
+            // still reads as "save states are supported".
+            host_40 <= host_20[0] ? 32'h0000_444D : 32'h0000_0000;
+            hstate <= ST_DONE_OK;
+        end
         default: begin
             hstate <= ST_DONE_ERR;
         end
@@ -511,13 +686,96 @@ always @(posedge clk) begin
     endcase
 
 
+    /* THE WATCHDOG COVERS THE DATA-SLOT COMMANDS AND NOTHING ELSE
+     * (2026-11-01).
+     *
+     * It was written for 0x0180/0x0184/0x0190/0x0192 -- the file commands this
+     * core issues, which the host can ignore -- but it was counted for ANY
+     * state that was not idle, and that includes `TARG_ST_WAITRESULT_RTR`: the
+     * `cm 0140` that tells the framework the core is ready to run.
+     *
+     * That one must never be withdrawn. On the panel the OS answers it while it
+     * is still bringing the core up (reading the card, mapping the data slots),
+     * and a launch that took longer than 0.90 s had its ready-to-run marker
+     * cleared out from under it -- after which the framework can only report
+     * "core not ready to run" and the core never starts. It is the one target
+     * command that has no failure mode worth timing out: if the framework never
+     * answers, it is not going to run the core either way.
+     *
+     * So the counter now runs only in the two data-slot states (see
+     * TARG_WD_MAX), and RTR waits exactly as the template's does. */
+    if(tstate == TARG_ST_DATASLOTOP || tstate == TARG_ST_WAITRESULT_DSO ||
+       tstate == TARG_ST_WAITRESULT_RTR) begin
+        if(targ_wd != TARG_WD_MAX) targ_wd <= targ_wd + 1;
+    end else
+        targ_wd <= 0;
+
+    /* NOTHING MAY BE IN FLIGHT WHEN THE HOST RESETS US (2026-11-02).
+     *
+     * Quit begins with `[0010 Reset Enter]`, which drops `reset_n`. A target
+     * command that was outstanding at that moment leaves `cm` sitting in the
+     * target->host command register: the framework has already passed the point
+     * where it runs one, so it never clears, and the core spends the shutdown
+     * looking like it is in the middle of a transfer. That is not a state a core
+     * gets closed cleanly from -- the reference dumper waits 1.8 s after its
+     * last command for exactly this reason, and every earlier attempt at this
+     * core's quit went black at the moment the OS started taking it down.
+     *
+     * So the reset wins over whatever is in flight: the marker is cleared, the
+     * issuer is told (error 7, "nobody answered", which is distinct from any
+     * result code the host itself uses), and the block goes back to idle. This
+     * is also what makes a `[0010`-triggered slot load safe -- nothing is left
+     * pointing at a struct in a core that is about to be reconfigured. */
+    dso_q    <= dataslot_allcomplete;
+    inmenu_q <= osnotify_inmenu;
+
+    if(!reset_n || targ_abort) begin
+        target_0             <= 32'h0;
+        target_dataslot_err  <= 3'd7;
+        target_dataslot_done <= (tstate != TARG_ST_IDLE);
+        flushing             <= 1'b0;
+        tstate               <= TARG_ST_IDLE;
+        /* AND SO IS EVERYTHING WAITING BEHIND IT (2026-11-02).
+         *
+         * Clearing `tstate` alone does not stop the next command, it starts it:
+         * the queues below are what the idle state reads, and they were left
+         * untouched. So the reset that ends a shutdown handed the framework a
+         * fresh `[0184` to run -- a target command arriving at the exact moment
+         * the OS has stopped running them. That is a `cm` standing in `target_0`
+         * for a core that is being unloaded, which is the quit that goes black.
+         *
+         * A queued command is the core's own request (rtl/gt_save_file.sv), so
+         * dropping it costs a save and never a console -- and the writer already
+         * treats "nobody answered" as "stop, do not retry". */
+        target_dataslot_read_queue     <= 0;
+        target_dataslot_write_queue    <= 0;
+        target_dataslot_getfile_queue  <= 0;
+        target_dataslot_openfile_queue <= 0;
+        target_dataslot_flush_queue    <= 0;
+    end
     // target > host command executer
-    case(tstate)
+    else case(tstate)
     TARG_ST_IDLE: begin
 
         target_dataslot_ack <= 0;
+        flushing            <= 0;
 
-        if(status_setup_done_queue) begin
+        /* THE READY-TO-RUN MARKER YIELDS TO A COMMAND THIS CORE OWNS
+         * (2026-11-02).
+         *
+         * `cm 0140` is written into `target_0` the moment `status_setup_done`
+         * rises, and it then OWNS `target_0` until the framework answers it.
+         * Every other target command this core can issue waits behind it. That
+         * is harmless in a core that never issues one; this core writes the
+         * `.sav` (rtl/gt_save_file.sv), so a marker the framework did not pick
+         * up held the save for the whole session and the `.sav` stayed empty.
+         *
+         * Deferring it here costs nothing: the queue bit stays set and this
+         * branch runs again as soon as the queued command has been answered. */
+        if(status_setup_done_queue &&
+           !(target_dataslot_read_queue   | target_dataslot_write_queue |
+             target_dataslot_getfile_queue | target_dataslot_openfile_queue |
+             target_dataslot_flush_queue)) begin
             status_setup_done_queue <= 0;
             tstate <= TARG_ST_READYTORUN;
 
@@ -560,6 +818,22 @@ always @(posedge clk) begin
             target_24 <= target_buffer_param_struct; // pointer to the bram that will hold the parameter struct
                                                      // which must contain the desired filename and flag/size before command execution
             tstate <= TARG_ST_DATASLOTOP;
+
+        end else if(target_dataslot_flush_queue) begin
+            target_dataslot_flush_queue <= 0;
+            target_0[15:0] <= 16'h0188;
+
+            target_20 <= target_dataslot_id;
+            target_24 <= 32'h0;
+            target_28 <= 32'h0;
+            target_2C <= 32'h0;
+
+            // per-flush: 0 until this one is answered
+            target_dataslot_flush_seen   <= 0;
+            target_dataslot_flush_result <= 0;
+            flushing                     <= 1;
+
+            tstate <= TARG_ST_DATASLOTOP;
         end
     end
     TARG_ST_READYTORUN: begin
@@ -574,24 +848,73 @@ always @(posedge clk) begin
         tstate <= TARG_ST_WAITRESULT_DSO;
     end
     TARG_ST_WAITRESULT_DSO: begin
-        if(target_0[31:16] == 16'h6275) begin
-            target_dataslot_ack <= 1;
-        end
-        if(target_0[31:16] == 16'h6F6B) begin
-            // done
-            // save result code
-            target_dataslot_err <= target_0[2:0];
-            // assert done
+        if(flushing) begin
+            if(target_0[31:16] == 16'h6F6B) begin
+                target_dataslot_flush_seen   <= 1;
+                target_dataslot_flush_result <= target_0[2:0];
+                target_0                     <= 32'h0; // swallowed, not a verdict
+            end
+            if(targ_wd == FLUSH_WD) begin
+                target_0             <= 32'h0;
+                target_dataslot_err  <= 3'd0;   // not a failure of anything
+                target_dataslot_done <= 1;
+                tstate               <= TARG_ST_IDLE;
+            end
+        end else if(targ_wd == TARG_WD_MAX) begin
+            /* NOBODY ANSWERED, AND THAT IS NOT ONE OF THE HOST'S CODES (2026-11-02).
+             *
+             * This used to report 5, which is also the host's own "general
+             * error" for `[0192]`. rtl/gt_save_file.sv cannot tell them apart,
+             * and it behaved accordingly: it read "nobody answered" as "this
+             * byte order was refused" and walked all eight of them, so ONE save
+             * the host was not servicing became ~14 s of a target command
+             * permanently in flight -- and a quit inside that window is a quit
+             * with a command outstanding. 7 is unused by every documented
+             * result code (0..5), so the writer can stop on the first silence
+             * instead of retrying a search that cannot succeed. */
+            target_0             <= 32'h0;
+            target_dataslot_err  <= 3'd7;
             target_dataslot_done <= 1;
             tstate <= TARG_ST_IDLE;
+        end else begin
+            if(target_0[31:16] == 16'h6275) begin
+                target_dataslot_ack <= 1;
+            end
+            if(target_0[31:16] == 16'h6F6B) begin
+                // done
+                // save result code
+                target_dataslot_err <= target_0[2:0];
+                // assert done
+                target_dataslot_done <= 1;
+                tstate <= TARG_ST_IDLE;
+            end
         end
     end
     TARG_ST_WAITRESULT_RTR: begin
+        /* THE MARKER IS RE-OFFERED, NOT WAITED ON FOREVER (2026-11-02).
+         *
+         * This state used to have no exit but the host's `ok`, and its note
+         * said the marker "stays up until the framework answers it, however
+         * long the launch takes". That holds only if the framework is going to
+         * answer -- and this marker is raised a few milliseconds after
+         * configuration, while the OS is still streaming the cartridge, so
+         * whether it is seen depends on when the OS next looks at its target
+         * register. When it is not seen, the target channel parks here for the
+         * session: no `[0184` is ever issued (the `.sav` stays empty), and the
+         * reset clear releases whatever was queued into a host that is closing
+         * (the quit that goes black).
+         *
+         * On expiry the marker is WITHDRAWN and put back in the queue, so idle
+         * re-offers it -- after any command the save writer is waiting on. The
+         * framework is never left holding a `cm` this core has stopped tracking,
+         * and the marker keeps being offered until it is taken. */
         if(target_0[31:16] == 16'h6F6B) begin
-            // done
             tstate <= TARG_ST_IDLE;
+        end else if(targ_wd == TARG_WD_MAX) begin
+            target_0                <= 32'h0;
+            status_setup_done_queue <= 1;
+            tstate                  <= TARG_ST_IDLE;
         end
-
     end
     endcase
 

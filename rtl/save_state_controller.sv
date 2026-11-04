@@ -19,27 +19,24 @@
  * present `size` bytes at a byte address in the host's own memory, and to take
  * `size` bytes back from it. The address is this core's declaration
  * (`savestate_addr` = 0x40000000 in core_top, matching the NES core's own
- * choice), the size is mc64_savestates' 66056 bytes, and the bridge hands the
+ * choice), the size is this core's 69,688 bytes, and the bridge hands the
  * transfers over as reads and writes carrying `bridge_addr[31:28] == 4'h4` --
  * one 32-bit word per access, little-endian inside the word (the first byte of
  * the file is in bits [7:0], which is what bridge_endian_little = 1 means for
  * the cartridge path too).
  *
- * WHY THE FIFOS ARE OURS AND NOT dcfifo. See rtl/mc64_async_fifo.sv: the
+ * WHY THE BUFFER IS OURS AND NOT dcfifo. See rtl/gt_state_buffer.sv: the
  * APF framework's streamer modules are built on Altera's mixed-width dcfifo,
  * and this tree has never carried a megafunction it could replace with twenty
- * lines. One per direction, both 64 bits wide (the engine's word):
+ * lines. Both directions carry 64-bit engine words through that one buffer:
  *
- *   save: written in the machine domain by mc64_savestates, read in clk_74a to
+ *   save: written in the machine domain by gt_savestates, read in clk_74a to
  *         answer the host's reads. The engine makes a word every ~8 machine
  *         cycles; the host's ceiling is one 32-bit read every 88 clk_74a cycles
  *         (io_bridge_peripheral's own number), i.e. two reads -- one word --
- *         per ~22 machine cycles. THE ENGINE IS THE FASTER SIDE BY ~2.7x, and
- *         that is the whole reason `fifo_save` is only 256 entries of
- *         CROSSING: behind it is `mc64_state_store`, the whole state's worth
- *         of words, so the copy finishes at the RAM port's rate and the host
- *         reads afterwards instead of the machine waiting for it (2026-10-18;
- *         the panel's *saves take forever*).
+ *         per ~22 machine cycles. THE ENGINE IS THE FASTER SIDE BY ~2.7x, so
+ *         the whole state is staged in one buffer and the host reads it at its
+ *         own pace (2026-10-18; the panel's *saves take forever*).
  *
  *   load: written in clk_74a from the host's writes, read by the engine. Here
  *         the host is the slower side by the same ratio, so the FIFO absorbs
@@ -83,18 +80,29 @@ module save_state_controller #(
     // clk_74a cycles is answered err: 2^23 / 74.25 MHz = 113 ms, against a
     // whole state's ~40 ms in either direction.
     parameter int WATCHDOG_BITS = 24,
-    // THE LOAD'S STAGING BUFFER, in 64-bit words. It must hold the whole blob the
-    // host is allowed to hand over, because the host CANNOT BE PACED: an APF
-    // bridge write has no backpressure, so whatever the host outruns has to fit.
-    // core_top passes `savestate_maxloadsize`/8 here, so the declaration of what
-    // the OS may send and the buffer that has to take it cannot drift apart.
-    // 8769 x 64 bits = 561 Kbit = 56 M10K blocks on the 5CEBA4 (which the fit is
-    // 18% and 71/308 blocks into before this).
-    parameter int STAGE_WORDS = 8769,
+    /* THE SHARED STAGING BUFFER, in 64-bit words.
+     *
+     * IT MUST BE THE WHOLE BLOB, and a 4,096-word version was tried and rejected
+     * on 2026-11-01: the OS writes every word of the file into the 0x4 window
+     * and only THEN issues the load command (sim/gt/tb_core_ss.cpp models that
+     * order, which is the panel's). So all 8,711 words have to be held before the
+     * engine is told anything -- there is no stream to keep up with and nothing
+     * to pace. 4,096 dropped the tail and the load stopped completing.
+     *
+     * 8,970 x 64 bits = 71 M10K blocks on the 5CEBA4. `MAX_WORDS` is that same
+     * declaration -- core_top passes `savestate_maxloadsize`/8 -- and the counter
+     * below is sized from it rather than from the array. */
+    parameter int STAGE_WORDS = 8970,
+    parameter int MAX_WORDS   = 8970,
     /* The engine's format tag (its STATESIZE), so this module can tell the
      * host's two 32-bit halves apart on the first word of a stream. See THE
      * HOST'S HALF ORDER below. */
-    parameter logic [31:0] TAG = 32'h0001_0200
+    parameter logic [31:0] TAG = 32'd69704,
+    /* How many 64-bit words the state the engine will ask for actually is
+     * (`savestate_size` / 8 -- core_top passes its own SS_BYTES / 8, so this
+     * cannot drift from the blob the OS is told about). A load is not ARMED
+     * until this many words are staged: see THE WHOLE FILE FIRST below. */
+    parameter int STATE_WORDS = 8714
 ) (
     // ---- the host side: the APF bridge, in clk_74a ----
     input  logic        clk_74a,
@@ -144,30 +152,32 @@ module save_state_controller #(
 );
 
     /* ================================================================== *
-     * The two crossings, one FIFO each
-     * ================================================================== */
+     * One buffer, both directions
+     * ================================================================== *
+     *
+     * gt_state_buffer is the whole state's worth of storage, and its two
+     * ports turn around with `mode_load`: on a save the engine writes and the
+     * host reads; on a load the host writes and the engine reads. The two
+     * directions are never in flight together, so one M10K array covers both
+     * -- and the 8,967-word array is ~59 blocks, not the 80 the separate store
+     * and load stage took.
+     *
+     * The pointer crossings and the flush settle are inside that module. This
+     * controller keeps only what is its own: the host's half-word bookkeeping,
+     * the command handshake, the arm/overrun gates, and the direction.
+     */
     wire [63:0] save_q;
     wire        save_empty;
     logic       save_rd;
+    logic       mode_load = 1'b0;   // 1 = the buffer's host side is a load
 
-
-
-    /* ---- flushing the FIFOs between sessions --------------------------
+    /* ---- flushing the buffers between sessions --------------------------
      *
-     * A load that is refused (a file whose header tag is not this build's)
-     * leaves the host's stream sitting in the load FIFO, and a save the OS
-     * stopped reading leaves the engine's words in the save FIFO. Neither may
-     * seed the next transfer, so each is emptied before a command starts one.
-     *
-     * The write pointer belongs to one clock domain and the read pointer to
-     * the other, so a flush is one pointer reset in each: the request toggles
-     * in clk_74a and the machine side edge-detects it, exactly like the two
-     * state requests (see the header). A flush is only ever asked for with the
-     * engine idle, so no half-consumed word can be thrown away by one.
-     */
-    // Only the SAVE side needs one now: the load side's stream boundary is the
-    // word count (word 0 sets it to zero), which is a reset in the writer's own
-    // domain and needs no crossing at all -- see the staging note below.
+     * A save the OS stopped reading leaves words behind, and a refused load
+     * leaves the host's stream behind. Neither may seed the next transfer, so
+     * the save side is flushed at the start of every save. The load side starts
+     * at its own word 0 instead (load_start), which is a pointer reset in the
+     * writer's domain and needs no crossing at all. */
     logic        save_flush_tog = 1'b0;
     logic        save_flush_74a;                      // this domain's own pulse
     logic [2:0]  save_flush_s = 3'd0;
@@ -178,176 +188,31 @@ module save_state_controller #(
 
     wire save_flush_core = save_flush_s[2] ^ save_flush_s[1];
 
-    /* ---- the save side: the crossing, then a staging buffer -------------
+    wire [63:0] load_wdata;
+    wire        load_full;
+
+    /* ---- the load side's host bookkeeping -------------------------------
      *
-     * THE ENGINE MUST NOT WAIT FOR THE HOST (2026-10-18). It used to: the FIFO
-     * below was the whole buffer, the engine produces a word every ~8 machine
-     * clocks and the host reads one every ~22 (two 32-bit accesses at its
-     * 88-cycle ceiling), so 256 entries filled within a few hundred words and
-     * the rest of the state was copied at the HOST's pace -- with the machine
-     * stopped, because a state is taken with the CPU held. The panel's *saves
-     * work, but they take forever* was that 40 ms; the copy is 10.
+     * The storage and the pointer crossing are inside gt_state_buffer. What
+     * this side still needs is a count of the whole words the host has handed
+     * over, because two gates are expressed in words: the engine is not armed
+     * until the whole state has arrived, and the host may not write past the
+     * declared maximum. `wr_count` is that count; it resets at word 0 of a
+     * stream and advances on the high half that closes each word.
      *
-     * So the FIFO is now only the crossing (its 256 entries cover the few
-     * cycles between the two clocks) and `mc64_state_store` behind it is the
-     * buffer the whole state fits in, drained at a word per clk_74a cycle. The
-     * engine never sees `save_full`, its copy runs at the RAM port's own rate,
-     * and the machine is handed back while the host is still reading the words
-     * out. See rtl/mc64_state_store.sv for why the depth could not simply go
-     * into the FIFO (its read is combinational, and an M10K's is not).
+     * `ss_load_empty`/`ss_load_data` now come straight from the buffer's core
+     * port, so a new stream's pointer reset is the buffer's own business.
      */
-    wire [63:0] fifo_q;
-    wire        fifo_empty;
-    logic       fifo_rd;
+    // The COUNT is the declaration's width, not the buffer's: a 4,096-word
+    // buffer still sees 8,711 words of stream, and a 13-bit counter would wrap
+    // at 8,192 and call the tail word 0 again.
+    localparam int CNT_W = $clog2(MAX_WORDS + 1);
+    logic [CNT_W-1:0] wr_count = '0;       // words taken from the host (clk_74a)
+    wire [CNT_W-1:0] wr_count_n = wr_count + 1'b1;
 
-    mc64_async_fifo #(.WIDTH(64), .AW(8)) fifo_save (
-        .wclk   (clk_core),
-        .wrst   (reset_core | save_flush_core),
-        .wr     (ss_save_wr),
-        .wdata  (ss_save_data),
-        .wfull  (ss_save_full),
-        .wcount (),
-        .rclk   (clk_74a),
-        .rrst   (reset_74a | save_flush_74a),
-        .rd     (fifo_rd),
-        .rdata  (fifo_q),
-        .rempty (fifo_empty),
-        .rcount ()
-    );
-
-    // The state is 8,257 words (header + registers + 64 KB); 8,192 of them fit
-    // here and the last 65 ride out on the host's own reads (~1,400 machine
-    // clocks, 1% of the copy). A power of two keeps the store's pointer wrap
-    // a drop of the top bit.
-    localparam int SAVE_STORE_WORDS = 8192;
-
-    logic        save_store_full;
-
-    /* THE DRAIN WAITS FOR THE FLUSH TO SETTLE (2026-10-18). `rempty` is this
-     * side's view of a pointer pair, and the WRITE pointer reaches it through
-     * two flops: in the first few clk_74a cycles after a flush its synchronised
-     * copy still reads as the previous transfer's write pointer, so a drain that
-     * started at once saw a non-empty FIFO and popped one of the OLD words into
-     * the store -- before the engine's own stream had even begun. The host then
-     * read that stale word as word 0 and every word after it was misaligned by
-     * one, i.e. a save that reads back as zeros with the same shape as a
-     * transfer that never happened.
-     *
-     * So the drain is held off for 31 clk_74a cycles after the flush -- far more
-     * than the two flops need, and far less than the frame the engine waits for
-     * before it can produce its first word. Nothing else uses the count. */
-    logic [4:0] save_flush_cnt = 5'd0;
-
-    assign fifo_rd = !fifo_empty && !save_store_full && (save_flush_cnt == 5'd0);
-
-    /* `save_q`/`save_empty`/`save_rd` keep their names, so the host's whole
-     * read path -- the address key, the held word, the underrun report -- is
-     * unchanged; only what is behind them changed. `save_flush_74a` drops the
-     * store with the FIFO, so a new save starts at its own word 0. */
-    mc64_state_store #(.WORDS(SAVE_STORE_WORDS), .WIDTH(64)) store_save (
-        .clk   (clk_74a),
-        .reset (reset_74a | save_flush_74a),
-        .wr    (fifo_rd),
-        .wdata (fifo_q),
-        .full  (save_store_full),
-        .rd    (save_rd),
-        .rdata (save_q),
-        .empty (save_empty)
-    );
-
-    /* ---- the load side's staging buffer ---------------------------------
-     *
-     * THIS REPLACED A 256-ENTRY FIFO (2026-10-17), and why is the whole point of
-     * the change. A load's data comes from the HOST, and the APF's bridge cannot
-     * be paced for a write: there is no signal the core can hold to make the
-     * host wait. So the core has to absorb whatever the host sends, and the
-     * arithmetic here is brutal:
-     *
-     *   the blob is 66 KB (8257 words), a burst host can send one 32-bit word per
-     *   bridge cycle, and the MACHINE can only take a 64-bit word every nine
-     *   machine clocks -- 8 bytes, one per clock, through the RAM's byte-wide
-     *   port A -- i.e. 5.7 MB/s. A memcpy into the window is five to fifty times
-     *   faster than that.
-     *
-     * 2 KB of FIFO therefore overflowed within microseconds of the host starting
-     * (measured, with an unpaced copy-in in sim/tb_savestate.cpp: `overrun 1`, the
-     * command left at result code 1, the state half-applied), and the words the
-     * overflow dropped are words the engine then waited for for ever: the
-     * transfer never finished and the panel's OS reported what it saw, *the OS
-     * lets you save and gives an error when you load*. The SAVE direction has
-     * always been safe from this -- there the engine is the producer and the FIFO
-     * is the throttle -- which is exactly why the two directions behaved
-     * differently on the panel.
-     *
-     * So the load side stages the WHOLE blob (spec 21.4). The host may write as
-     * fast as the bridge takes it; the engine drains at its own rate and the only
-     * thing that can now fail is a blob larger than `STAGE_WORDS`, which is a
-     * capacity statement (the same one `savestate_maxloadsize` makes to the OS to
-     * begin with) rather than a race, and it is reported as an error rather than
-     * dropping words silently.
-     *
-     * The two sides are described by COUNTS, not by entries: the host's words are
-     * CONTIGUOUS from word 0 (it is a memcpy), so the writer keeps `wr_count` --
-     * the number of whole words it has taken -- and the reader keeps its own
-     * `rd_count`, and `ss_load_empty` is simply `rd_count == wr_count` (crossed).
-     * That is what makes a new stream safe with no flush: word 0 of a stream sets
-     * `wr_count` back to 0, so the reader can never see the previous transfer's
-     * leftovers no matter what is still sitting in the buffer. */
-    logic [63:0] load_stage [0:STAGE_WORDS-1];
-
-    localparam int STAGE_AW = $clog2(STAGE_WORDS);   // 14 for 8769
-
-    logic [STAGE_AW:0] wr_count = '0;      // words taken from the host (clk_74a)
-    logic [STAGE_AW:0] wr_gray  = '0;
-    logic [STAGE_AW:0] wr_gray_s1 = '0, wr_gray_s2 = '0;
-    logic [STAGE_AW:0] rd_count = '0;      // words the engine has taken (clk_core)
-    logic [STAGE_AW:0] wr_count_r = '0;    // ... and the host's count, this domain
-
-    wire [STAGE_AW:0] wr_count_n = wr_count + 1'b1;
-
-    /* The count itself is written in the host-side always block below (one
-     * driver per register -- the fit rejects two), so what is left here is the
-     * crossing and the reader's own end of it. */
-    always_ff @(posedge clk_core) begin
-        if (reset_core) begin
-            wr_gray_s1 <= '0;
-            wr_gray_s2 <= '0;
-        end else begin
-            wr_gray_s1 <= wr_gray;
-            wr_gray_s2 <= wr_gray_s1;
-        end
-    end
-
-    /* THE READER'S COUNT, AND WHY IT NEEDS NO CROSSING OF ITS OWN. It is the
-     * writer's count that says where a stream starts: word 0 sets it back to
-     * zero, and the reader's count -- which can never be ahead of it while a
-     * transfer runs, because the reader stops at it -- is then GREATER than the
-     * count it can see, which is the signal that a new stream has begun. So the
-     * reset condition is expressed entirely in this domain: no extra synchroniser
-     * and no race with the engine about which side notices first. */
-    always_ff @(posedge clk_core) begin
-        if (reset_core)
-            rd_count <= '0;
-        else if (rd_count > wr_count_r)
-            rd_count <= '0;              // the host's count went backwards: new stream
-        else if (ss_load_rd)
-            rd_count <= rd_count + 1'b1;
-    end
-
-    /* Gray back to binary, one running XOR from the top down -- the same
-     * conversion mc64_async_fifo does, because it is the same crossing. */
-    always_comb begin
-        wr_count_r[STAGE_AW] = wr_gray_s2[STAGE_AW];
-        for (int i = STAGE_AW - 1; i >= 0; i--)
-            wr_count_r[i] = wr_count_r[i+1] ^ wr_gray_s2[i];
-    end
-
-    assign ss_load_data  = load_stage[rd_count[STAGE_AW-1:0]];
-    /* `>=` and not `==`: in the cycle or two after a new stream's word 0 the
-     * reader's count is still ahead of the crossed one, and that window must read
-     * as EMPTY (nothing is available) rather than as "there is a word" -- which
-     * would hand the engine an entry from the previous transfer. */
-    assign ss_load_empty = (rd_count >= wr_count_r);
+    /* Words that must be in the buffer before the engine applies any of it: the
+     * state's own length, because the host has finished writing by then. */
+    localparam int LOAD_ARM_WORDS = (STAGE_WORDS < STATE_WORDS) ? STAGE_WORDS : STATE_WORDS;
 
     /* ================================================================== *
      * The host side: the buffer, in clk_74a
@@ -389,6 +254,27 @@ module save_state_controller #(
 
     logic        prev_start = 1'b0;
     logic        start_go   = 1'b0;   // a save request waiting for the engine
+    /* THIS CORE'S ONE DEPARTURE FROM mc64's `ok`, AND WHY IT IS NEEDED HERE.
+     *
+     * mc64 reports `ok` the moment the engine's FIRST word lands, which is
+     * safe there for a reason peculiar to mc64: its engine is 2.7x the host's
+     * own read rate, so the host can never ask for a word that is not there
+     * yet. GameTank's engine is within a few percent of the host's rate -- it
+     * walks PSRAM a byte at a time and the host reads a word every ~176
+     * clk_74a -- so with `ok` at the first word the host catches up inside the
+     * first few hundred words and from then on every read is answered from a
+     * store that has not been written yet. The controller does not pop an
+     * address it cannot answer (that is the underrun path), so the OS re-reads
+     * the same word: the file it writes is word-for-word plausible and wrong,
+     * which is the worst possible failure to debug from the panel.
+     *
+     * The buffer holds the WHOLE state (8,967 words against 8,711), so the race
+     * does not have to be won -- it can be removed. `ok` now waits for the
+     * engine to FINISH: the blob is complete in the store before the host is
+     * told there is one. Cost: the OS polls ~10 ms instead of ~20 us, against a
+     * 113 ms watchdog here and a multi-second patience on its side. */
+    logic        save_kicked = 1'b0;  // this command's engine start has gone out
+    logic        save_ran    = 1'b0;  // ... and the engine has been seen at work
     logic        save_tog_q = 1'b0;
     logic        load_tog_q = 1'b0;
     logic        abort_tog_q = 1'b0;
@@ -403,6 +289,8 @@ module save_state_controller #(
     wire         swap_word  = (wr_count == '0)
                             ? ((load_lo == TAG) && (bridge_wr_data != TAG))
                             : swapped;
+    assign load_wdata = swap_word ? {load_lo, bridge_wr_data}
+                                  : {bridge_wr_data, load_lo};
 
     assign save_tog = save_tog_q;
     assign load_tog = load_tog_q;
@@ -423,10 +311,19 @@ module save_state_controller #(
 
     wire engine_busy   = busy_s[2];
     wire load_done_now = done_s[2] ^ done_s[1];   // the pulse, edge-detected
-    // The engine's refusal is a LEVEL (its error flag stays set until the next
-    // request), so it is edge-detected here the way the completion is, and it
-    // answers the command that is in flight when it arrives.
-    wire engine_err_now = err_s[2] ^ err_s[1];
+    /* THE ENGINE'S REFUSAL IS A LEVEL, SO ONLY ITS RISE IS A REFUSAL (2026-10-28).
+     *
+     * `err_q` stays set until the next request clears it, and the clear is a
+     * FALLING edge on this side. XOR-ing the two synchroniser stages -- which is
+     * right for the completion pulse, because a pulse is one cycle -- therefore
+     * reported the CLEARING as a refusal: every load commanded after a refused
+     * one was answered err while the engine was already applying it. The panel
+     * sees exactly that as "a bad Memory makes the good one fail to load", and
+     * only the next command clears it again.
+     *
+     * The rising edge is the refusal. (The clear is not a verdict about
+     * anything; nothing needs to observe it.) */
+    wire engine_err_now = err_s[1] & ~err_s[2];   // err_s[0] is the newest
 
     wire ss_load_rising = ss_load & ~ss_load_prev;
 
@@ -540,7 +437,8 @@ module save_state_controller #(
 
     wire        load_stage_wr = wr_hit && bridge_addr[2] &&
                                 (bridge_addr[27:3] == {2'b0, wr_count}) &&
-                                (wr_count != STAGE_WORDS[STAGE_AW:0]);
+                                (wr_count != MAX_WORDS[CNT_W-1:0]) &&
+                                !load_full;
 
     /* ... AND A LOAD WAITS FOR THE ENGINE THE SAME WAY A SAVE DOES
      * (2026-10-18). `load_tog_q` is the same kind of toggle the save side uses,
@@ -549,8 +447,34 @@ module save_state_controller #(
      * consumed and dropped, the transfer never started, and the watchdog
      * answered err on the load. That is one of the shapes of "it won't load":
      * the state was fine and the request never reached the engine. */
+    /* THE WHOLE FILE FIRST, SO A SHORT ONE IS REFUSED WITHOUT BEING APPLIED
+     * (2026-10-28).
+     *
+     * The machine-side engine writes each word of a load into the console's own
+     * RAM as it reads it, so a stream that stops short leaves a state applied
+     * HALF WAY -- one state's stack, another's variables -- and the watchdog that
+     * eventually answers err cannot undo that. The panel's OS reads the file off
+     * the card itself, so a short stream is not hypothetical: an interrupted copy
+     * or a file that is smaller than this build's state is exactly what it looks
+     * like.
+     *
+     * The staging buffer holds the whole blob (that is why `STAGE_WORDS` is what
+     * `savestate_maxloadsize` promises), so the fix is to use it as the gate:
+     * arm the engine only when `STATE_WORDS` whole words have ARRIVED. Then a
+     * short file never starts the engine at all -- the machine is not touched,
+     * and the command ends in err from the stall clock, which is a refusal the
+     * user can retry rather than a console they have to reload. A foreign file
+     * of the right size still reaches the engine and is refused by its tag check,
+     * with the machine untouched there too (the tag is word 0, read before any
+     * memory is written).
+     *
+     * Both host orderings still work: a host that streams first has the count
+     * already, so this arms on the command's own cycle; a host that commands
+     * first arms when its last word lands. What is gone is the case where the
+     * engine started on a prefix and had to be aborted out of it. */
     wire load_arm = !load_active && load_cmd_pending && stream_started &&
-                    !engine_busy;
+                    !engine_busy &&
+                    (wr_count >= LOAD_ARM_WORDS[CNT_W-1:0]);
 
     // A transfer is in flight if the engine is driving one or the host is
     // waiting on one. Both are watched: the OS streams before it commands (the
@@ -638,11 +562,6 @@ module save_state_controller #(
             ss_load_ack    <= 1'b0;
             save_flush_74a <= 1'b0;
 
-            if (save_flush_74a)
-                save_flush_cnt <= 5'd31;          // the drain's settling window
-            else if (save_flush_cnt != 5'd0)
-                save_flush_cnt <= save_flush_cnt - 5'd1;
-
             ss_load_prev <= ss_load;
             prev_start   <= ss_start;
 
@@ -650,12 +569,13 @@ module save_state_controller #(
             rd_hold      <= 64'd0;
             last_rd_word <= 25'h1FF_FFFF;
             wr_count     <= '0;
-            wr_gray      <= '0;
             load_cmd_pending <= 1'b0;
             stream_started   <= 1'b0;
             load_data_seen <= 1'b0;
             load_active  <= 1'b0;
             start_go     <= 1'b0;
+            save_kicked  <= 1'b0;
+            save_ran     <= 1'b0;
 
             ss_start_busy <= 1'b0;
             ss_start_ok   <= 1'b0;
@@ -665,6 +585,7 @@ module save_state_controller #(
             ss_load_err   <= 1'b0;
             underrun_q    <= 1'b0;
             overrun_q     <= 1'b0;
+            mode_load     <= 1'b0;
         end
         else begin
 
@@ -735,17 +656,21 @@ module save_state_controller #(
                 // part of the new state, because the reader only ever reads what
                 // the count says has arrived.
                 wr_count <= '0;
-                wr_gray  <= '0;
                 stream_started <= 1'b1;   // ... and a load command now has data
             end
             else if (load_stage_wr) begin
-                // The count of whole words taken, and the gray copy of it that
-                // the reader's domain sees. `wr_count_n` is derived from the
-                // register, so the staged word above and this count always
-                // describe the same index.
+                // The count of whole words taken. The buffer keeps the pointer;
+                // this count is what the arm and the overrun gate read.
                 wr_count <= wr_count_n;
-                wr_gray  <= (wr_count_n >> 1) ^ wr_count_n;
             end
+
+            // The buffer's host port turns around with the direction. Word 0
+            // of a load puts it back in load mode; a save's flush puts it back
+            // in save mode.
+            if (load_new_stream)
+                mode_load <= 1'b1;
+            else if (save_flush_74a)
+                mode_load <= 1'b0;
 
 
             /* ---------------------------------------------------------- *
@@ -796,7 +721,7 @@ module save_state_controller #(
                 load_data_seen <= 1'b1;      // ... so the stream is under way
                 if (bridge_addr[2] &&
                     (bridge_addr[27:3] == {2'b0, wr_count}) &&
-                    (wr_count == STAGE_WORDS[STAGE_AW:0]))
+                    (wr_count == MAX_WORDS[CNT_W-1:0]))
                     // A blob bigger than the buffer. This is a capacity statement
                     // (the same one `savestate_maxloadsize` makes to the OS)
                     // and not a race: the words are not dropped silently.
@@ -814,9 +739,8 @@ module save_state_controller #(
                     // mid-buffer) keeps whatever order the last stream decided
                     // (`swap_word` is `swapped` again for every later word).
                     swapped <= swap_word;
-                    load_stage[wr_count[STAGE_AW-1:0]] <=
-                        swap_word ? {load_lo, bridge_wr_data}     // the host's way round
-                                  : {bridge_wr_data, load_lo};    // this file's way round
+                    // The word itself is written by the shared buffer from
+                    // `load_wdata` on this same high half (see the instance).
                 end
                 else if (!bridge_addr[2])
                     load_lo <= bridge_wr_data;
@@ -828,9 +752,29 @@ module save_state_controller #(
              * the cycle it GOES idle when it was not. It lives outside the
              * command block below because that block is an if/else-if chain
              * armed on the request edge, and this has to be able to fire on a
-             * later cycle while `ss_start_busy` is counting. */
-            if ((save_take || start_go) && !engine_busy) begin
+             * later cycle while `ss_start_busy` is counting.
+             *
+             * A DEFERRED KICK DIES WITH ITS COMMAND (2026-11-02). `start_go` is
+             * set when the command finds the engine busy and waits for it to go
+             * idle -- but nothing cleared it when that command ENDED, and a
+             * command ends on its 113 ms watchdog as well as on ok. So a save
+             * that timed out left a kick armed: the next time the engine went
+             * idle, a save nobody had asked for started, flushed the store and
+             * walked the machine with no `ss_start_busy` -- no owner, no clock,
+             * and its words landing under whatever the host was doing by then
+             * (a load's stream, in the worst case). Gating the deferred half on
+             * the command still being in flight is what makes the wait it asked
+             * for belong to it. */
+            if ((save_take || (start_go && ss_start_busy)) && !engine_busy) begin
                 start_go     <= 1'b0;
+                save_kicked  <= 1'b1;
+                // `ok` MEANS "THIS TRANSFER HAS A WORD", not "the last one did".
+                // With this left set, a save whose read-out the host abandoned
+                // could answer ok off the previous transfer's store -- a Memory
+                // that is a tail of the last one, which loads and is wrong.
+                // (The flush below empties the store for the same reason; this
+                // is the flag that proves it happened.)
+                save_ran     <= 1'b0;
                 save_tog_q   <= ~save_tog_q;
                 // Empty the pipe first: a save the OS stopped reading halfway
                 // leaves its words in the FIFO, and the first read of this save
@@ -845,6 +789,12 @@ module save_state_controller #(
                 rd_hold      <= 64'd0;
                 last_rd_word <= 25'h1FF_FFFF;
             end
+
+            // `ok` waits for the engine to be seen AT WORK and then idle: a kick
+            // and an idle engine are both true in the cycle of the kick itself,
+            // and `ok` taken then is `ok` before a single word exists.
+            if (save_kicked && engine_busy)
+                save_ran <= 1'b1;
 
             /* ---------------------------------------------------------- *
              * Command 0x00A0: take a state
@@ -902,6 +852,13 @@ module save_state_controller #(
                     ss_start_ok   <= 1'b0;
                     ss_start_err  <= 1'b0;
                     start_wd      <= '0;
+                    // The kicked/ran pair is NOT touched here: the kick below
+                    // fires in this same cycle when the engine is idle (the
+                    // accept branch is a request's own cycle), and a clear
+                    // here would be the last write to win -- the command would
+                    // be kicked, `ran` could never set, and `ok` would never
+                    // come, which is a save that walks the whole machine and
+                    // then answers the 113 ms watchdog with an error.
                     // Held if the engine is mid-transfer; the kick below fires
                     // the cycle it is not (and fires this same cycle when it
                     // never was).
@@ -970,7 +927,28 @@ module save_state_controller #(
                 // after the engine starts, and the OS's own round trip to the
                 // buffer is longer than that. If it never lands, the watchdog
                 // above answers err, which is the honest report.
-                else if (!start_go && engine_busy && !save_empty) begin
+                /* ok AT THE FIRST WORD, NOT AT THE END (2026-10-25).
+                 *
+                 * This used to also require `!engine_busy` -- ok only once the
+                 * engine had finished the whole walk. That is a *correct* rule
+                 * and it is not the one this hardware is asking for: it holds
+                 * the host's `busy` for the entire copy (~8 ms, 36 KB at six
+                 * clocks a byte) where the core that saves fine on this same
+                 * panel holds it for the two microseconds its first word takes.
+                 * The comment above already describes the intended promise --
+                 * "ok on the engine's first request ... the same promise made
+                 * with an empty flag" -- so the code now matches it: a word is
+                 * in the store, the host may read.
+                 *
+                 * The race the old rule was closing cannot happen here: the
+                 * buffer is the whole state's worth (8,967 words against 8,711),
+                 * the engine produces a word every ~6 clocks per byte and the
+                 * host takes one per two bridge accesses, so the engine stays
+                 * ahead, and if it ever did not the controller refuses to consume
+                 * the address and `underrun` says so -- which is a detected
+                 * fault, not a silent one. tb_core_ss requires zero underruns
+                 * across the whole read-out for exactly this reason. */
+                else if (save_kicked && save_ran && !save_empty) begin
                     ss_start_busy <= 1'b0;
                     ss_start_ok   <= 1'b1;
                 end
@@ -1138,5 +1116,36 @@ module save_state_controller #(
     assign ss_rd_data = rd_high ? rd_hold[63:32]
                      : rd_new  ? save_q[31:0]
                      :           rd_hold[31:0];
+
+    /* ================================================================== *
+     * The shared storage
+     *
+     * One array, two clocks, and the direction turns around with `mode_load`.
+     * A save: the engine writes on clk_core, the host reads on clk_74a. A load:
+     * the host writes on clk_74a (starting at `load_new_stream`), the engine
+     * reads on clk_core. The two are never in flight together.
+     * ================================================================== */
+    gt_state_buffer #(.WORDS(STAGE_WORDS)) state_buffer (
+        .clk_74a         (clk_74a),
+        .clk_core        (clk_core),
+        .reset_74a       (reset_74a),
+        .reset_core      (reset_core),
+        .mode_load       (mode_load),
+        .load_start      (load_new_stream),
+        .save_flush_74a  (save_flush_74a),
+        .save_flush_core (save_flush_core),
+        .save_wr         (ss_save_wr),
+        .save_wdata      (ss_save_data),
+        .save_full       (ss_save_full),
+        .save_rd         (save_rd),
+        .save_rdata      (save_q),
+        .save_empty      (save_empty),
+        .load_wr         (load_stage_wr),
+        .load_wdata      (load_wdata),
+        .load_full       (load_full),
+        .load_rd         (ss_load_rd),
+        .load_rdata      (ss_load_data),
+        .load_empty      (ss_load_empty)
+    );
 
 endmodule

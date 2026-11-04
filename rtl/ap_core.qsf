@@ -1,5 +1,5 @@
 # --------------------------------------------------------------------------- #
-# Minicube64 -- Analogue Pocket core
+# GameTank -- Analogue Pocket core
 #
 # Derived from C:/Code/Wasm4/VexiiRiscv/ap_core.qsf, a Pocket core that builds
 # and runs on hardware.  Taken from it: the device, the pin/location
@@ -11,8 +11,8 @@
 # the one place to edit when a source is added.
 #
 # The project lives in rtl/ (ap_core.qpf/.qsf sit next to the sources), so every
-# path in this file is relative to rtl/ -- that is why they read "mc64_top.sv"
-# and not "rtl/mc64_top.sv". Compile from rtl/:  quartus_sh --flow compile ap_core
+# path in this file is relative to rtl/ -- that is why they read "core_top.v"
+# and not "rtl/core_top.v". Compile from rtl/:  quartus_sh --flow compile ap_core
 # --------------------------------------------------------------------------- #
 
 # -------------------------------------------------------------------------- #
@@ -334,7 +334,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 # failing setup path on the instruction-fetch address is exactly the
 # "silicon delivers the wrong word, sim is fine" class this project kept
 # chasing. Standard Fit runs the full timing-driven optimisation.
-set_global_assignment -name FITTER_EFFORT "FAST FIT"
+set_global_assignment -name FITTER_EFFORT "STANDARD FIT"
 set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION ON
 
 # Enables Physical Synthesis to push performance limits
@@ -342,8 +342,8 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT FAST
 #was EXTRA
 set_global_assignment -name ADVANCED_PHYSICAL_SYNTHESIS ON
 set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
-set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 0.1
-set_global_assignment -name ROUTER_EFFORT_MULTIPLIER 0.1
+set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1
+set_global_assignment -name ROUTER_EFFORT_MULTIPLIER 1
 # BOTTEM 2 WERE 4.0
 
 # Assembler Assignments
@@ -797,36 +797,14 @@ set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to bridge_spimosi
 # set_global_assignment -name VERILOG_MACRO "VID_NO_CLOCK90"
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# THE DIAGNOSTIC SWITCH THAT USED TO BE HERE IS GONE (2026-10-15).
-#
-# `MC64_BOOT_PICTURE_ALWAYS` held the bring-up grid and the six status blocks on
-# the link whatever `run_core` did, so one flash answered both "are the 24 RGB
-# bits arriving intact" and "where did the boot stop".  The picture itself was
-# removed from core_top.v (2026-10-15) because it had become a loading screen on
-# the panel -- it sat there for the whole quiet window between the OS finishing a
-# cartridge and this core releasing the machine -- so a switch that keeps a
-# deleted picture on the link has nothing left to switch.  See
-# docs/minicube64-fpga-spec.md s.14 for the removal and its consequences, and
-# `dbg_boot_state` for the six boot conditions it used to draw (asserted by
-# tools/boot_sim.sh; readable in any simulation build).
-#
-# The question that switch was for -- "is a black panel a dead link or a machine
-# with nothing to draw" -- is now answered by the handshake instead: a file list
-# appearing at all is the proof that clk_74a, the bridge and the package are
-# good (spec s.15).  For the link itself, the panel's test is a cart whose output
-# is already known: white.bin / bars.bin are on the card (see the ROM test in the
-# spec).
-# ---------------------------------------------------------------------------
 
 
 
 # ===========================================================================
-# Source file list -- Minicube64.
+# Source file list -- GameTank.
 #
-# Everything sits in the flat rtl/ directory.  The APF framework files were
-# copied here from C:/Code/Wasm4/VexiiRiscv; the stock APF versions this project
-# started from are kept beside them as *.stock.bak, so nothing was lost.
+# Everything sits in the flat rtl/ directory; every path below is relative
+# to it, so the build runs from rtl/.
 # ===========================================================================
 
 # ---- APF framework --------------------------------------------------------
@@ -838,133 +816,95 @@ set_global_assignment -name VERILOG_FILE mf_datatable.v
 set_global_assignment -name VERILOG_FILE mf_ddio_bidir_12.v
 set_global_assignment -name QIP_FILE mf_datatable.qip
 set_global_assignment -name QIP_FILE mf_ddio_bidir_12.qip
-# rtl/apf.qip lists these same six files. VexiiRiscv lists them individually and
-# leaves the .qip commented out; same here, so the order is explicit.
-#set_global_assignment -name QIP_FILE apf.qip
-
-# ---- Minicube64 machine ---------------------------------------------------
-# Quartus needs one define here. rtl/timescale.vh writes its directive as
-# `timescale `TS_UNIT/`TS_PREC, and Quartus reads a `timescale before it expands
-# macros: it stops with Error 10096 ("incorrect use of predefined text macro
-# timescale") and rtl/cpu_6502.sv and rtl/alu_6502.sv then parse as zero design
-# units. NO_TIMESCALE is config.vh's switch for exactly this, and the Tiny
-# Tapeout side of this repo drives synthesis the same way. Keep the line: with it
-# removed the two CPU files parse as zero design units again.
-set_global_assignment -name VERILOG_MACRO "NO_TIMESCALE=1"
-
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_top.sv
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_ram.sv
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_video.sv
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_audio.sv
-set_global_assignment -name SYSTEMVERILOG_FILE cpu_6502.sv
-set_global_assignment -name SYSTEMVERILOG_FILE alu_6502.sv
-
-# ---- APU -------------------------------------------------------------------
-# rtl/apu.sv is agg23/openfpga-NES's rtl/upstream/apu.sv (Kitrinx's cycle-based
-# NES APU) and mc64_top instantiates it at $0110-$0130, the window machine.c
-# diverts. The three files move together:
-#
-#   apu.sv            the APU itself. Its three package imports are the only
-#                     edit to the upstream file -- upstream resolves those names
-#                     through a compilation-unit import in its ppu.sv.
-#   regs_savestates.sv  MiSTer's index table, which the APU takes four indices
-#                     from and reads its power-on defaults out of. Only the
-#                     table is here; the framework that drives the bus is not
-#                     (see the note at the bottom of this file).
-#   eReg_SavestateV.v the register primitive apu.sv instantiates, in
-#                     Verilog-2001 so the fit and every Verilator harness build
-#                     the same definition -- Verilator cannot elaborate the
-#                     VHDL entity of the same name in rtl/bus_savestates.vhd,
-#                     and building the two from different sources is the split
-#                     tools/lint.sh's third pass exists to prevent.
-set_global_assignment -name SYSTEMVERILOG_FILE apu.sv
-set_global_assignment -name SYSTEMVERILOG_FILE regs_savestates.sv
-set_global_assignment -name VERILOG_FILE eReg_SavestateV.v
 
 # ---- core_top: the APF wrapper --------------------------------------------
-# rtl/core_top_template.v and rtl/core_bridge_cmd_template.v are the APF's stock
-# originals and must stay OUT of the build: core_top_template.v defines a module
-# also called core_top, so both in the fit is a duplicate-entity error in
-# Analysis & Synthesis. They are reference material.
 set_global_assignment -name VERILOG_FILE core_top.v
+# The boot cartridge ($readmemh of bootcart.mem, resolved from this directory)
+set_global_assignment -name VERILOG_FILE bootcart_rom.v
+set_global_assignment -name SYSTEMVERILOG_FILE gametank.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_savestates.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_save_slot.sv
+# The core's own .sav writer (target commands 0184/0188/0190/0192).
+set_global_assignment -name SYSTEMVERILOG_FILE save_state_controller.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_state_buffer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gtvideo.sv
+set_global_assignment -name SYSTEMVERILOG_FILE palette.sv
+set_global_assignment -name SYSTEMVERILOG_FILE vram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE frame_snapshot.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mainbus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE blitter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE acp.sv
+# The output stage: DAC level -> the Pocket's I2S (four-pole filter, pause mute).
+set_global_assignment -name SYSTEMVERILOG_FILE gt_audio.sv
+set_global_assignment -name SYSTEMVERILOG_FILE pads.sv
+set_global_assignment -name SYSTEMVERILOG_FILE cart.sv
+set_global_assignment -name SYSTEMVERILOG_FILE savectl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mem_bus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE psram.sv
+set_global_assignment -name VERILOG_FILE cpu_65c02.v
+set_global_assignment -name VERILOG_FILE alu_65c02.v
+set_global_assignment -name SYSTEMVERILOG_FILE via6522.v
+set_global_assignment -name VERILOG_FILE mf_pll_gt_console.v
+set_global_assignment -name VERILOG_FILE mf_pll_gt_video.v
 set_global_assignment -name VERILOG_FILE core_bridge_cmd.v
 
 # ---- clocks ---------------------------------------------------------------
-# One PLL, written in the shape of the framework's own IP. See
-# rtl/mf_pll_mc64_0002.v for the settings, for the machine/pixel ratio
-# (160/33 -- 22,000 pixels of 1.32 MHz is exactly 60.000000 Hz, which is the
-# whole reason the pixel clock is not a whole division of the machine), and for
-# the 90-degree phase. No .qip: there is nothing here for the IP upgrader to
-# touch. Read the fit report's PLL section back: outclk_1 1.320000 MHz at a
-# 189.394 ns shift.
-set_global_assignment -name VERILOG_FILE mf_pll_mc64.v
-set_global_assignment -name VERILOG_FILE mf_pll_mc64_0002.v
+# Two PLLs, both hand-written in the shape of the framework's own IP, so
+# there is no .qip and nothing for the IP upgrader to regenerate:
+#
+#   mf_pll_gt_console.v  74.25 MHz -> 28.636364 MHz console, 12.288 MHz audio
+#   mf_pll_gt_video.v    74.25 MHz -> 2.25 MHz pixel, plus its 90-degree twin
+#
+# The console rate is the NTSC colour subcarrier x 8 (315/11 MHz), the rate
+# the real GameTank runs at, and 12.288 MHz / 256 is 48.000 kHz for the APF's
+# audio. The video rate is 150 x 250 x 60 Hz: an exact 33:1 division of
+# 74.25 MHz, so there is no fractional-N jitter on the DDR launch clock or on
+# the quarter-period phase shift. Read both back in the fit report's PLL
+# section.
 
 # ---- timing constraints ---------------------------------------------------
 # apf_constraints.sdc is Analogue's and says not to edit it: it already declares
-# clk_74a/clk_74b/bridge_spiclk and calls derive_pll_clocks. core_constraints.sdc
+# clk_74a/clk_74b/bridge_spiclk and calls derive_pll_clocks. gt_constraints.sdc
 # is ours and holds only what the framework leaves out.
+#
+# ORDER IS PART OF THE CONSTRAINT. Quartus reads these in the order they appear
+# here, and gt_constraints.sdc's whole job is to group clocks that apf's file
+# creates -- so it has to be read second. In the 2026-10-24 fit it was listed
+# first, every get_clocks filter in it matched nothing, and Quartus ignored the
+# entire file (Warning 332049 at gt_constraints.sdc lines 98, 153, 154). With no
+# groups and no false paths, TimeQuest timed the console -> video synchronisers
+# as single-cycle transfers and reported -25.9 ns on a 673 ns clock.
 set_global_assignment -name SDC_FILE apf_constraints.sdc
-set_global_assignment -name SDC_FILE core_constraints.sdc
+set_global_assignment -name SDC_FILE gt_constraints.sdc
 
 # ---- save states ----------------------------------------------------------
 #
 # The whole stack, in the fit and in every simulation, from three files that do
 # not exist upstream:
 #
-#   mc64_savestates.sv        what a state IS: an 8-byte header, the 64 words
-#                             the framework's register bus carries, and the
-#                             machine's 64 KB of RAM in address order.
+#   gt_savestates.sv          what a state IS and the order its regions are
+#                             walked in: CPU and ACP state, the window
+#                             registers, 32 KB of RAM, 4 KB of audio RAM,
+#                             the framebuffer and the 6522.
 #   save_state_controller.sv  the APF end: the 0x40000000 buffer the OS reads
-#                             and writes, the command handshake, and the two
-#                             FIFOs between clk_74a and the machine.
-#   mc64_async_fifo.sv        one gray-pointer dual-clock FIFO, instantiated
-#                             twice (one per direction); 256 entries, the
-#                             crossing and nothing more.
-#   mc64_state_store.sv       the save direction's staging buffer: the state's
-#                             words land here at a word per clk_74a cycle, so
-#                             the engine's copy is the freeze and the host's
-#                             read of 66 KB happens after the machine is back.
+#                             and writes, and the command handshake.
+#   gt_state_buffer.sv        ONE 64-bit buffer for both directions (2026-10-24):
+#                             the save drain and the load stage share it, with
+#                             the host's port on clk_74a and the engine's on
+#                             clk_core. As two arrays they were 135 M10K blocks
+#                             and the core needed 351 against the device's 308.
+#                             The whole state lands in it at the engine's own
+#                             rate, so the machine is handed back while the
+#                             host is still reading its 69,688 bytes out.
 #
-# The MiSTer framework's own engines -- rtl/savestates.vhd, statemanager.vhd,
-# bus_savestates.vhd, savestate_ui.sv, which have been in rtl/ since the port
-# began -- stay OUT of this list, and that is the one deliberate divergence:
-#
-#   * they are VHDL, and every pre-fit check in this project is Verilator, which
-#     cannot elaborate VHDL -- the same reason rtl/eReg_SavestateV.v exists as
-#     the Verilog twin of bus_savestates.vhd's entity. One definition, in both
-#     builds, is the rule tools/lint.sh's third pass enforces; with the state
-#     engine it is also what makes the state path SIMULATABLE (see
-#     sim/tb_savestate.cpp, which drives a save and a load through the APF
-#     bridge and compares the machine against itself).
-#   * savestates.vhd is written around a fixed six-region memory map (OAM,
-#     mapper RAM, CHR, CHR-VRAM, CPU-RAM, CARTRAM) with an SDRAM arbiter on the
-#     far side; this machine's whole memory is one 64 KB block RAM with a port
-#     the engine can borrow, and its file format has one memory region.
-#   * statemanager.vhd and savestate_ui.sv bring MiSTer's keyboard/gamepad slot
-#     shortcuts and its rewind ring buffer. On the Pocket the OS owns the slots
-#     and the file, and it asks the core for exactly one state at a time
-#     (commands 0x00A0/0x00A4); nothing in this machine consumes a slot number
-#     or a rewind.
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_savestates.sv
-set_global_assignment -name SYSTEMVERILOG_FILE save_state_controller.sv
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_async_fifo.sv
-set_global_assignment -name SYSTEMVERILOG_FILE mc64_state_store.sv
-
-# ---- not wired up yet: uncomment each as it lands -------------------------
-#
-# rtl/data_loader.sv and rtl/data_unloader.sv are the framework's bridge
-# streamers. They are built on the dcfifo megafunction and are NOT used: the
-# cartridge path in core_top is its own four-phase handshake and the state path
-# is the same gray-pointer FIFO pair, both choices VexiiRiscv made. Left out on
-# purpose.
-#
-# CLOCKS are real now, in the clocks section above: 6.4 MHz machine (and the
-# same rate half a cycle later for RAM port A), 1.32 MHz pixel, its 90-degree
-# twin and 12.184615 MHz audio, all from clk_74a. Two things to read off the fit
-# report: outclk_1 must be 1.320000 MHz -- the frame rate is that divided by
-# 22,000 and nothing else makes it exactly 60 Hz -- and outclk_2's phase must be
-# a quarter of the pixel period (189.394 ns).
+# This core carries its own save-state engine instead of the MiSTer
+# framework's (savestates.vhd, statemanager.vhd, savestate_ui.sv): that one
+# is written around a fixed six-region memory map with an SDRAM arbiter, and
+# it brings MiSTer's keyboard slot shortcuts and its rewind ring buffer. On
+# the Pocket the OS owns the slots and the file, and it asks the core for
+# exactly one state at a time (commands 0x00A0/0x00A4).
 
 
 set_global_assignment -name EDA_SIMULATION_TOOL "<None>"
