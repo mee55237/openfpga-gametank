@@ -575,11 +575,12 @@ module core_top (
   wire [31:0] ss_rd_data;
 
   /* THE WRITER'S FLYING LEADS ARE GONE WITH IT (2026-11-03). rtl/gt_save_file.sv
-   * and every net it owned -- its 0x0300_0000 struct windows, its target-command
-   * outputs, its [0180] restore, its interact hook -- are removed. The save path
-   * is the platform's: the OS reads the Save data slot out at exit ([0080]) and
-   * writes it back at launch ([0082]), and this core only serves that window.
-   * See the note where the writer used to be, further down. */
+   * and every net it owned -- its target-command outputs, its [0180] restore, its
+   * interact hook -- are removed. The save path is the platform's: the OS reads
+   * the Save data slot out at exit ([0080]) and writes it back at launch
+   * ([0082]), and this core only serves that window. The 0x0300_0000 window it
+   * used for a struct is gone; on a RAM32K cart the same 0x0200_0000 window
+   * holds the 32 KB SRAM instead of the image (see the note below). */
 
   /* DECLARED HERE BECAUSE THE SAVE SLOT IS ABOVE THEM (2026-11-02).
    * The slot instance sits at the top of this file's APF section and the video
@@ -734,18 +735,174 @@ module core_top (
   wire [55:0] ss_diag = {diag_drops, diag_resets, diag_saves, diag_loads,
                          save_diag, diag_code, diag_reads};
 
+  /* ---- ONE SAVE SLOT, TWO CARTRIDGE SAVE TYPES (2026-11-04) -----------
+   *
+   * A GameTank cartridge saves in one of two ways:
+   *
+   *   * a flash cart rewrites its own image. The save is the 2 MB cartridge,
+   *     and the OS's Save slot carries that image (rtl/gt_save_slot.sv
+   *     streams it back out of PSRAM at shutdown, rtl/cart.sv restores it at
+   *     launch);
+   *   * a RAM32K cart has 32 KB of battery-backed SRAM at $8000-$BFFF. The
+   *     save is that array (rtl/gt_nvram.sv), and the emulator persists it
+   *     as a 32 KB .sav as well.
+   *
+   * Both are the SAME data slot. The APF names a nonvolatile slot from slot
+   * 0's filename plus that slot's first extension, so two slots whose first
+   * extension is "sav" would be the same file on the card and would
+   * overwrite each other. data.json therefore declares one Save slot, and
+   * this core decides what it means from the cartridge in front of it: the
+   * size word in the table below changes with it, and the OS writes the
+   * 32 KB SRAM or the 2 MB image accordingly.
+   *
+   * THE CARTRIDGE SAYS WHICH, BEFORE THE SAVE ARRIVES. The signature is the
+   * emulator's (gte.cpp, LoadRomFile): a 2 MB image whose bytes at $1FFFF0
+   * are "SAVE" is Flash2M_RAM32K. It is captured here, on the slot-1 bridge
+   * writes, not at the end of the download in rtl/cart.sv -- the OS starts
+   * loading the Save slot as soon as the cartridge has been sent, and this
+   * decision has to be made before the first save byte arrives. The first
+   * word of a new cartridge clears it, so a different game cannot inherit
+   * the last one's type. */
+  wire slot1_hit = bridge_wr && (bridge_addr[31:28] == 4'h1);
+  wire slot2_hit = bridge_wr && (bridge_addr[31:24] == 8'h02);
+
+  reg [21:0] cart_decl_size = 22'd0;
+
+  // The first word of any cartridge stream. Both the identity and the
+  // signature restart here, so a new file cannot inherit either from the last
+  // one -- see the capture below.
+  wire cart_new = slot1_hit && (bridge_addr[20:0] == 21'h0000000);
+
+  reg  [31:0] sig_word = 32'h0;
+  always @(posedge clk_74a) begin
+    if (cart_new)
+      sig_word <= 32'h0;                  // a new image starts at offset 0
+    else if (slot1_hit && (bridge_addr[20:0] == 21'h1FFFF0))
+      sig_word <= bridge_wr_data;         // $1FFFF0..3 = "SAVE", little-endian
+  end
+
+  wire ram32k_s = (cart_decl_size == 22'h200000) &&
+                  (sig_word == 32'h4556_4153);   // "SAVE" as a 32-bit word
+
+  // The console sees the same decision through rtl/gametank.sv -> rtl/cart.sv.
+  // It is latched at the end of the download there; by then this has been
+  // stable for the whole cartridge transfer.
+  reg ram32k_c1 = 1'b0, ram32k_c2 = 1'b0;
+  always @(posedge clk_core) begin
+    ram32k_c1 <= ram32k_s;
+    ram32k_c2 <= ram32k_c1;
+  end
+
+  wire [31:0] nv_bridge_rdata;
+
+  /* ---- the core's own save file (rtl/gt_save_file.sv) --------------------
+   *
+   * A save committed at the instant the game writes it, rather than at the
+   * shutdown read-out -- see the module's own header. It needs three things
+   * from here: the slot's window (it makes the HOST read it, through [0184), the
+   * host's target-command channel, and a struct window at 0x0300_0000, which is
+   * the second address below.
+   */
+  wire        sf_rd_hit;
+  wire [31:0] sf_rd_data;
+  wire        sf_slot_arm, sf_slot_full;
+  wire [21:0] sf_slot_start;
+  wire [8:0]  sf_slot_thresh;
+
+  /* ---- what the game rewrote (2026-11-08) --------------------------------
+   *
+   * rtl/cart.sv counts the span in the machine's clock; the writer captures it
+   * in clk_74a. `sf_span_req_c` is the request two flops into the machine's
+   * clock, `sf_span_ack_c` is the answer back in its own, and the three values
+   * are static from the ack until the next request -- so they cross as a bus
+   * without a tear (the handshake is what makes that true; see rtl/cart.sv).
+   */
+  wire        sf_span_req, sf_span_ack_c, sf_span_any;
+  wire [20:0] sf_span_lo, sf_span_hi;
+  reg  [1:0]  sf_span_req_c = 2'b00;
+  reg  [1:0]  sf_span_ack_s = 2'b00;
+  wire [21:0] ss_win_words;
+  wire        sf_t_write, sf_t_read, sf_t_getfile, sf_t_openfile, sf_t_flush;
+  wire [15:0] sf_t_id;
+  wire [31:0] sf_t_slotoffset, sf_t_bridgeaddr, sf_t_length;
+  wire [31:0] sf_t_param, sf_t_resp;
+  wire        sf_t_done;
+  wire [2:0]  sf_t_err;
+  wire        sf_busy, sf_done, sf_failed;
+
+  /* ---- the launch restore, as a FALLBACK ONLY (2026-11-09) ---------------
+   *
+   * pocket/data.json marks the Save slot `"nonvolatile": false`, so the OS
+   * never reads it out at quit: no read-out, no card traffic, no 2 MB write at
+   * the end of a session. That is the whole point of the flag and it is what
+   * makes the quit a command instead of a transfer.
+   *
+   * `"deferload"` STAYS FALSE, and that is the correction this build carries.
+   * It was true, which told the framework not to load the `.sav` at launch --
+   * so the boot had no save in it AND this core asked for one before the
+   * framework had finished handing over the cartridge. The panel answered with
+   * "error in framework: core not ready to run", which is the framework
+   * waiting for a `[0140]` this core had already put in `target_0` and could
+   * not get back to: the whole boot was being spent in data-slot commands.
+   *
+   * With it false the launch is the platform's own, exactly as in every build
+   * of this core that booted: the framework loads the cartridge, then the
+   * `.sav` into the same window, then sends `[008F]`. rtl/gt_save_file.sv only
+   * has to write; it does not have to read the card back in.
+   *
+   * IT IS KEPT AS A FALLBACK, because that path is also what the note in
+   * rtl/gt_save_file.sv is about: a build with this slot not nonvolatile wrote
+   * nothing at all, and if that ever turns out to mean "not loaded either" the
+   * core must still boot the game it has. So the restore runs only when the
+   * framework did NOT put the slot in this launch -- see the arming below. In
+   * the ordinary case it never runs, and the sim checks both cases by name.
+   */
+
+  // Declared above its use: this file is compiled as Verilog-2001, where a use
+  // before the declaration is an implicit 1-bit net of the same name rather
+  // than this signal.
+  wire reset_n;                 // host has taken us out of reset
+
+  wire sf_load_req;             // clk_74a pulse: restore the .sav; assigned below
+
+  wire sf_load_busy;
+  wire sf_load_done;
+  wire        gt_save_trig;
+
+  /* DECLARED HERE, DRIVEN FAR BELOW (2026-11-09). `sf_load_lost` is set when a
+   * launch restore does not finish in time, and `save_trig_ok` is the writer's
+   * trigger with it gated off -- a file that could not be read must not be
+   * overwritten with a fresh game's save. Both are used at the save writer's
+   * input, which is above the hold ceiling that drives them, and this file is
+   * compiled as Verilog-2001: a use before the declaration would be an implicit
+   * 1-bit net and a different signal. */
+  reg         sf_load_lost = 1'b0;
+  wire        save_trig_ok = gt_save_trig & ~sf_load_lost;
+
+  // "the window holds this chunk": the writer's threshold is in 64-bit
+  // entries, and the slot's count is the same unit.
+  assign sf_slot_full = (ss_win_words >= {13'd0, sf_slot_thresh});
+
+  // The span handshake, one synchroniser each way (see rtl/cart.sv's ports).
+  always @(posedge clk_core)
+    sf_span_req_c <= {sf_span_req_c[0], sf_span_req};
+
+  always @(posedge clk_74a)
+    sf_span_ack_s <= {sf_span_ack_s[0], sf_span_ack_c};
+
   always @(*) begin
     if (ss_rd_hit)
       bridge_rd_data = ss_rd_data;
+    else if (sf_rd_hit)
+      bridge_rd_data = sf_rd_data;          // gt_save_file's struct window
     else if (bridge_addr[31:24] == 8'h02)
-      bridge_rd_data = ps_bridge_rdata;      // the Save data slot
+      // The Save slot: the cartridge image, or the RAM32K SRAM.
+      bridge_rd_data = ram32k_s ? nv_bridge_rdata : ps_bridge_rdata;
     else if (bridge_addr[31:24] == 8'hF8)
       bridge_rd_data = cmd_bridge_rd_data;
     else
       bridge_rd_data = 32'h0;
   end
-
-  wire reset_n;                 // host has taken us out of reset
 
   /* THE BRIDGE GOES QUIET WHEN THE HOST TAKES US DOWN (2026-11-02).
    *
@@ -779,8 +936,22 @@ module core_top (
    * It is `~reset_n` and NOT `apf_quiesce`: the 0x50 write that comes AFTER the
    * read-out also raises `external_reset`, and re-arming there would throw the
    * window away in the middle of the OS reading it. `[0010]` is the edge that
-   * is always before the transfer and never inside it. */
-  wire sf_prearm = ~reset_n;
+   * is always before the transfer and never inside it.
+   *
+   * On a RAM32K cart the Save slot is the 32 KB array, which the bridge reads
+   * directly; there is no stream to warm, and arming one would only make the
+   * OS wait for PSRAM words it is not going to read. */
+  wire sf_prearm = ~reset_n && !ram32k_s;
+
+  // The slot's own "the host is reading the image out" level. Declared here with
+  // `sf_prearm` rather than at its use below, because the machine's hold is
+  // assembled from both (see `save_stream`).
+  wire save_readout;
+  // ... and whether the stream still needs the memory port (rtl/gt_save_slot.sv's
+  // `hold_console`): the read-out outlives the FIFO's need for PSRAM by however
+  // long the OS takes to write the card, and holding the CPU for that is a
+  // frozen picture that looks like a crash.
+  wire ss_hold_console;
 
   // The data-slot write handshake, named so it can be probed (see the note at
   // its use, further down): the OS is told to stream only once the machine's
@@ -876,12 +1047,12 @@ module core_top (
    * finishing the .sta. It crashes there, before the screen capture, which is
    * the file we keep finding.
    *
-   * THE RULE. What this word declares is the SLOT, not the cartridge: the .sav
-   * is the 2 MB image region at PSRAM 0x100000 (rtl/gt_save_slot.sv streams the
-   * whole of it), data.json declares that slot at 2 MB, and the OS wrote 2 MB
-   * there itself. Declaring anything else would be the core telling the OS that
-   * the save file changed size, which is a different operation with its own file
-   * handling. */
+   * THE RULE. What this word declares is the SLOT, and on a flash or EEPROM
+   * cart the slot is the image region at PSRAM 0x100000 (rtl/gt_save_slot.sv
+   * streams the whole of it), data.json declares that slot at 2 MB, and the OS
+   * wrote the image there itself. Declaring anything else would be the core
+   * telling the OS that the save file changed size, which is a different
+   * operation with its own file handling. */
   /* WHAT THIS WORD HAS TO BE, FOR THE SECOND TIME (2026-10-26).
    *
    * It went from `cart_size` to a constant 2 MB on the theory that the .sta
@@ -919,6 +1090,17 @@ module core_top (
    * to `rtl/cart.sv` as the cart's identity. The .sav's size can then never
    * reach the type inference or this table, whatever is on the card. */
 
+  /* AND NOW THE SLOT HAS TWO CONTENTS (2026-11-04).
+   *
+   * The paragraphs above are the history of the image case and are still
+   * exactly right for it. What changed is that a RAM32K cart's save is its
+   * 32 KB battery-backed SRAM, not the image. The same Save slot carries it --
+   * two nonvolatile slots whose first extension is "sav" would be the same file
+   * on the card -- the bridge routes the window to rtl/gt_nvram.sv, and this
+   * word says 32,768 so the OS flushes 32 KB. `save_slot_size` below is the one
+   * place that decides, and `ram32k_s` is known from the cartridge's own
+   * signature before the Save slot loads. */
+
   /* THE CARTRIDGE'S SIZE IS THE FIRST SLOT'S, NOT THE FIRST MATCHING ID'S
    * (2026-11-02).
    *
@@ -940,23 +1122,302 @@ module core_top (
    * this path existed are 16 KB and 32 KB).
    *
    * Ordering is the one thing the APF guarantees here, so it is what is used. */
-  reg [21:0] cart_decl_size = 22'd0;
-  reg        cart_decl_seen = 1'b0;
+  /* ... AND A RUNTIME CARTRIDGE RELOAD IS STILL A CARTRIDGE (2026-11-04).
+   *
+   * `core_ready` is sticky, so "the first [0082] after reset" captured the
+   * size once per power-up. A cartridge picked again from the core menu
+   * without restarting the bitstream sends a new [0082] for slot 1, and the
+   * old size stayed: a 2 MB RAM32K game launched after a 32 KB cart kept the
+   * 32 KB identity (no SRAM save, 32 KB flush), and the reverse typed a
+   * 32 KB cart as 2 MB. The size table is read at flush, so the save file
+   * was the wrong size too.
+   *
+   * The capture is tied to the stream now: a [0082] records its size, and the
+   * first byte written to slot 1 (offset 0) adopts it. That is the one moment
+   * that is unambiguously the start of a cartridge transfer -- the Save slot
+   * writes 0x02xxxxxx and never 0x1xxxxxxx -- and it happens on every load,
+   * not only the first. The boot ordering still holds: slot 1's request is
+   * the one in flight when its stream starts, and the capture below also
+   * refuses the Save slot's id, so the Save slot's [0082] can never be the
+   * size adopted. A request whose transfer never starts changes nothing. */
+  /* ... AND ONLY THE CARTRIDGE SLOT'S REQUEST IS A DECLARATION (2026-11-04).
+   *
+   * The first version of the per-stream capture above recorded EVERY [0082],
+   * and took whichever was last when a slot-1 stream began. Ordering makes
+   * that the cartridge's request in every flow the APF documents, but a single
+   * `[0082]` for the Save slot arriving before an unrequested slot-1 stream
+   * would then hand this core the SAVE's size as the cartridge's identity: 32
+   * KB for a RAM32K save types a 2 MB cartridge as an EEPROM, and the reverse
+   * (a 2 MB save) types an EEPROM cart as Flash2M. The Save slot is id 2 in
+   * data.json and every save path in this core already keys on that id, so a
+   * request for it is never recorded here.
+   *
+   * A stream that begins with no cartridge request at all clears the identity
+   * instead of inheriting the previous cartridge's. rtl/cart.sv then types the
+   * image from what it actually received (`dl_size`), which is the fallback
+   * used before the declared size existed -- wrong for a RAM32K save, but a
+   * stale type from a different cartridge is worse: it would enable the SRAM
+   * window, and flush, for a game that has none. */
+  reg  [21:0] wr_req_size = 22'd0;        // last CARTRIDGE [0082]'s size
+  reg         wr_req_seen = 1'b0;         // ... since the last capture
 
   always @(posedge clk_74a) begin
     if (~core_ready) begin
       cart_decl_size <= 22'd0;
-      cart_decl_seen <= 1'b0;
+      wr_req_seen    <= 1'b0;
     end
-    else if (dataslot_requestwrite && !cart_decl_seen) begin
-      cart_decl_seen <= 1'b1;
-      cart_decl_size <= dataslot_requestwrite_size[21:0];
+    else begin
+      if (dataslot_requestwrite && (dataslot_requestwrite_id != 16'd2)) begin
+        wr_req_size <= dataslot_requestwrite_size[21:0];
+        wr_req_seen <= 1'b1;
+      end
+      // The first word of a slot-1 stream, on every load. Separate `if`, not
+      // `else`: the request can still be high here (it is cleared when the
+      // command FSM returns to idle, clocks after the ack), and it must not
+      // mask the capture.
+      if (cart_new) begin
+        cart_decl_size <= wr_req_seen ? wr_req_size : 22'd0;
+        wr_req_seen    <= 1'b0;
+      end
     end
   end
 
   localparam [31:0] SAVE_SLOT_MAX = 32'd2097152;
-  wire [31:0] save_slot_size = (cart_size != 22'd0) ? {10'd0, cart_size}
-                                                    : SAVE_SLOT_MAX;
+
+  /* THE FILE IS THE IMAGE FROM ITS LOWEST CHANGED BYTE UP (2026-11-09).
+   *
+   * A 2 MB flash cartridge costs the player a 2 MB write on every quit, and
+   * 92% of that file is the .gtr byte for byte: the game rewrote its save in
+   * one corner of the flash and nothing else moved. The OS writes exactly the
+   * number of bytes this table declares (Analogue, Core Boot Process: "taking
+   * into account any changes the core may have written to the Dataslot
+   * ID/Size Table, in case the file size should be expanded or shrunk"), so
+   * the size is the lever, and the file becomes:
+   *
+   *     [the cartridge's first 128 bytes][the image from `sv_lo` to its end]
+   *
+   * The head is not padding, and it is a whole MEMORY BURST (2026-11-09).
+   * rtl/core_top.v's restore probe compares a save's
+   * first eight words against the cartridge's own and refuses the file if more
+   * than one differs -- that is what stops one game's save being restored over
+   * another. A file that began at `sv_lo` would fail that check by
+   * construction, so it keeps the head, and the tail is found from the size:
+   * `sv_lo = cart_size - (size - 128)`. No magic, no header word, and a file
+   * written by an older build (size == cart_size) still reads as the raw image.
+   *
+   * 128 and not 32: rtl/gt_save_slot.sv fetches the window in sixteen-entry
+   * bursts from consecutive image addresses, so the head/tail boundary has to
+   * fall on a burst boundary or the rest of that burst answers the image where
+   * the file wants the tail -- 96 wrong bytes at the start of every save. The
+   * head is therefore one burst, and the eight words the probe compares are the
+   * first eight of it.
+   *
+   * `sv_lo` is the lowest image byte changed since the cartridge loaded
+   * (rtl/cart.sv's `worm_lo`), or the base the loaded file implies, whichever
+   * is lower. It only falls: a byte the game rewrote stays rewritten.
+   *
+   * Only flash cartridges (over 1 MB) do this. An EEPROM cart's save is its
+   * whole image and is a few KB, so the file stays exactly what it always was --
+   * `diff`-able against the .gtr, and instant to write. */
+  localparam [21:0] IMG_END = 22'h20_0000;
+
+  wire [20:0] worm_lo;
+  wire        worm_any;
+
+  reg  [21:0] sv_lo      = IMG_END;   // lowest changed byte, or IMG_END: none
+  reg  [21:0] sv_load_lo = 22'h0;     // ... the base the loaded file implies
+  reg         sv_load_tail = 1'b0;    // ... and whether that file was a tail
+
+  /* WHETHER A `.sav` WAS DELIVERED, AND WHAT IT SAID (2026-11-09).
+   *
+   * A flash cartridge that has never been written to has nothing to save: its
+   * `.sav` would be the `.gtr` byte for byte, so it has nothing to declare and
+   * the slot is not used: zero bytes (Analogue's own definition of the table's
+   * size word). These two recognise the two ways a delivered file says it --
+   * 128 bytes, the head alone with no tail, and 0 bytes with no data at all --
+   * and both mean the loader mapped the file as the head and the rest of the
+   * image is still the `.gtr`.
+   *
+   * The pair is needed because `sv_load_lo` cannot tell the two zero cases
+   * apart: a whole-image `.sav` from an older build also leaves it at 0. Hence
+   * `saw` (a [0082] for slot 2 arrived) and `head` (it announced a file no
+   * bigger than the 128-byte head). A whole-image file is not touched: its
+   * size stays the image's. */
+  reg         sv_saw_req  = 1'b0;
+  reg         sv_head_ok  = 1'b0;
+
+  /* A BYTE THAT LANDED IN THE SLOT IS A DELIVERY, `[0082]` OR NOT (2026-11-09).
+   *
+   * The zero-byte answer below is keyed on "nothing was ever delivered", which
+   * on paper is `~sv_saw_req`: the framework sends [0082] before any .sav it
+   * loads, and a cartridge with no .sav at all sends nothing. But if a build of
+   * the framework ever loads the slot without that command, the bytes alone
+   * would restore the image while `sv_saw_req` stayed low -- and the quit would
+   * then declare ZERO for a cartridge that had just had a save put in it, which
+   * truncates the file. That is the one mistake in this path that destroys
+   * data, so the fallback also demands that no slot-2 byte has landed: with a
+   * write in the window the answer stays the image's size, i.e. a rewrite that
+   * is merely slow, never a delete. */
+  reg         sv_win_seen = 1'b0;     // any host byte into 0x02xxxxxx
+
+  /* AN EMPTY FILE IS NOT A 2 MB IMAGE (2026-11-09).
+   *
+   * `head` used to mean "exactly 128", and 128 is only one of the two ways a
+   * `.sav` says "this cartridge has not saved". The other is ZERO bytes: that
+   * is what the OS leaves behind for a quit whose read-out never ran, and it
+   * is the file a session that saved nothing starts from when the slot is
+   * created empty. A zero-byte slot announces itself with `[0082]` and no
+   * bytes at all, so `saw` rose and `head` did not -- and the table then said
+   * `cart_size`, which makes the NEXT quit write back the whole 2 MB image of
+   * a cartridge that had not changed. The panel read that as "there is already
+   * a save and nothing to write, and the quit takes forever".
+   *
+   * A file of 1..127 bytes is in the same place: too short to be a tail
+   * (`sv_pack_load` needs more than 128) and too short to be the image, so the
+   * loader has mapped it as the head and the rest is still the `.gtr`. All
+   * three sizes mean the same thing -- this cartridge has not saved -- and the
+   * answer to them is the one below: zero bytes. */
+
+  /* NOTHING TO SAVE IS STILL A SAVE, AND SAYING OTHERWISE IS AN ERROR
+   * (2026-11-09, from the panel).
+   *
+   * There is no "skip this write-back" answer in the framework. `[0080 Data
+   * slot request read]` takes a result code, and 1 is *not allowed ever* --
+   * the protocol's "this slot can never be read", not "nothing changed". The
+   * core answered it for a session that had written nothing since its save was
+   * loaded, and the panel came back with `error in framework: slot 2 denied`:
+   * the file was left alone, but the OS reported the slot as broken on the way
+   * out. So the read-out always runs.
+   *
+   * What keeps it cheap is the SIZE, not a refusal, and the size for "nothing
+   * happened" is ZERO (2026-11-09, the panel again). It used to be 128 -- the
+   * file's head, "the image is still the .gtr" -- which is a true description
+   * of the cartridge but still makes the OS create a 128-byte `.sav` for a
+   * game that never saved, and the panel's next words were "there is still a
+   * 128-byte file when there is no save".
+   *
+   * Analogue's Host/Target Commands defines the table's word 1: "Size of the
+   * data slot. ZERO IF THE SLOT IS NOT USED." That is this case exactly, and
+   * it is the only value that can mean it -- `[0080]`'s result codes have no
+   * "skip" (1 is the `slot 2 denied` error, 2 is a hung quit), and the flush
+   * "updates the filesize on SD if it changed", so 0 changes it to nothing.
+   * rtl/gt_save_slot.sv's `empty` is the other half: a zero-byte file is zero
+   * words to stream, so the read-out is answered at once instead of waiting
+   * for a window that can never fill.
+   *
+   * A cartridge that DID save declares head + tail below its lowest written
+   * byte, a RAM32K cart declares its 32 KB array, and 0 is never one of those
+   * (see `sv_tail`, which any program or erase raises). */
+
+  /* THE SIZE IS A PIPELINE, NOT A 22 ns CONE (2026-11-09).
+   *
+   * Measured, not guessed. The 14:40 fit's worst path on the host clock was:
+   *
+   *   cart_decl_size[11] -> ram32k_s -> cart_size -> sv_lo_use (min)
+   *     -> sv_tail_base (max 128) -> sv_tail (<) -> save_slot_size
+   *     -> empty (== 0) -> span_words_74 -> wbin_s (==) -> hold_console
+   *
+   * 22.214 ns of arrival against a 17.420 ns requirement, -4.794 ns. Every term
+   * is quasi-static -- the cartridge's size, the lowest byte the game has
+   * written -- and all of it was being recomputed combinationally inside the
+   * save slot's hold decision, at 74 MHz. Raising the fitter's effort moved it
+   * 0.38 ns: it is logic, not placement.
+   *
+   * So the arithmetic is a pipeline in clk_74a, one short stage per clock: the
+   * size and the base, then the tail, then the file's size, then "is it
+   * empty". A cartridge load or a game's write settles in a handful of clocks
+   * instead of having to settle inside one. Nothing downstream notices: the
+   * slot is armed tens of milliseconds before it is read, and the Dataslot
+   * ID/Size Table is checked at the flush.
+   *
+   * Clamped to this cartridge, and only a tail when something is below the top.
+   */
+  reg  [21:0] sv_cs_q     = 22'd0;      // cart_size, one stage in
+  reg         sv_ram_q    = 1'b0;       // ... and its RAM32K decision
+  reg  [21:0] sv_lo_use_q = 22'h3F_FFFF;
+  reg  [21:0] sv_base_q   = 22'd128;
+  reg         sv_tail_q   = 1'b0;
+  reg         sv_head_q   = 1'b0;
+  reg  [31:0] sv_size_q   = SAVE_SLOT_MAX;
+  reg         sv_empty_q  = 1'b0;
+
+  /* THE HEAD IS NOT PART OF THE TAIL (2026-11-09).
+   *
+   * A chip erase ($10) reports its range from image byte 0, and so does a
+   * program into the vector area, so `sv_lo` can be below the 128 bytes the
+   * file's head already covers. Sizing the tail from there wrote
+   * `cart_size + 128` bytes -- past the slot's `size_maximum` -- and the next
+   * launch reads such a file raw (its size is not below the image's), so every
+   * byte after the head landed 128 bytes high: the shift bug again, from a
+   * save that did nothing wrong. Clamping the base to the head makes that case
+   * exactly what it is, the whole image head-first, which is the file an older
+   * build wrote and which the loader already maps without a tail. */
+  wire [21:0] sv_base_c = (sv_lo_use_q < 22'd128) ? 22'd128 : sv_lo_use_q;
+  wire        sv_tail_c = !sv_ram_q && (sv_cs_q > 22'h10_0000) &&
+                          (sv_base_c < sv_cs_q);
+
+  /* ... AND A FLASH CARTRIDGE WHOSE IMAGE IS STILL THE `.gtr`: NOTHING TO
+   * WRITE, SO THE SLOT DECLARES ZERO BYTES AND THE OS HAS NO FILE TO MAKE.
+   *
+   * This used to hold only above 1 MB, on the argument that a small cartridge's
+   * save IS its whole image and the format does not change there. That is true
+   * of the FORMAT and false of the question being asked: an 8 KB Cubicle Knight
+   * that has not saved is in exactly the same position as a 2 MB Minicraft, and
+   * the panel's complaint -- "a .sav file when there is no save" -- is the same
+   * complaint at 8 KB as at 2 MB, only cheaper. The tail format stays gated at
+   * 1 MB because there the head+tail is what saves the transfer; the zero is
+   * not a format, it is "the slot is not used", and it is available at any size.
+   *
+   * The safety of the zero is `sv_head_ok` (the framework announced a file no
+   * bigger than the head) plus the fallback for a cartridge that has no `.sav`
+   * at all, where the framework announces nothing. That fallback also demands
+   * `~sv_win_seen`: if bytes landed in the slot without a `[0082]`, the slot is
+   * NOT unused, and the answer has to stay the image's size. Declaring zero
+   * there would truncate a save the framework had just restored. */
+  wire        sv_head_c = !sv_ram_q && !sv_tail_c &&
+                          (sv_head_ok | (~sv_saw_req && !sv_win_seen));
+
+  /* THE CARTRIDGE WHOSE .sav MAY HAVE A TAIL (2026-11-09).
+   *
+   * The format above is only ever used on a flash cartridge over 1 MB, and only
+   * for files this build wrote (an old whole-image .sav still reads as one, its
+   * size being the image's). This is that cartridge, independent of whether a
+   * save has happened yet -- the launch restore needs to know BEFORE any change
+   * exists, see the arm far below. */
+  wire        sf_tail_cart = !ram32k_s && (cart_size > 22'h10_0000);
+
+  /* WHAT THIS SLOT HOLDS ON THIS CARTRIDGE (2026-11-04). A flash cart's save
+   * is its image from the lowest changed byte; a RAM32K cart's is only the
+   * 32 KB SRAM, and reporting 2 MB for it would make the OS flush 2 MB of
+   * address space that aliases the same 32 KB over and over. Before a cartridge
+   * is loaded the maximum is the only safe answer; the value settles by the end
+   * of slot 1's transfer and is written by the FSM below. */
+  /* ... and the four stages themselves. Each assignment reads only registers,
+   * so each one has a single 22-bit compare or add to do in 13.5 ns. The HEAD
+   * and the TAIL are decided on the SAME stage: `sv_size_q` reads both from
+   * flops, so it can never see a new tail next to a stale head. */
+  wire [21:0] sv_tword_q = sv_lo_use_q[21:3];
+
+  always @(posedge clk_74a) begin
+      sv_cs_q     <= {1'b0, cart_size};
+      sv_ram_q    <= ram32k_s;
+
+      sv_lo_use_q <= (sv_lo > sv_cs_q) ? sv_cs_q : sv_lo;
+      sv_base_q   <= sv_base_c;
+
+      sv_tail_q   <= sv_tail_c;
+      sv_head_q   <= sv_head_c;
+
+      sv_size_q   <= sv_ram_q ? 32'd32768 :
+                     (sv_cs_q == 22'd0) ? SAVE_SLOT_MAX :
+                     sv_tail_q ? (128 + {10'd0, sv_cs_q} - {10'd0, sv_base_q}) :
+                     sv_head_q ? 32'd0 : {10'd0, sv_cs_q};
+
+      sv_empty_q  <= (sv_size_q == 32'd0);
+  end
+
+  // The registered answer, under the name everything below already uses.
+  wire [31:0] save_slot_size = sv_size_q;
 
   wire [9:0]  datatable_addr;
   wire        datatable_wren;
@@ -980,24 +1441,59 @@ module core_top (
    *     table once at a moment it picks. It is a coin flip at 74 MHz on the
    *     panel, which is why this class of bug keeps surviving a green run.
    *
-   * The value is a constant for the whole session -- it is the cartridge image's
-   * size, latched once the download has told us what it is. So it is written
-   * when it CHANGES, plus a slow refresh (one write per 2^16 clocks, ~0.9 ms) so
-   * that a value the OS clobbers through its own port is still put back. The
+   * The value is constant while a cartridge is loaded -- it is what the Save
+   * slot holds for that cartridge, known by the end of slot 1's transfer. So
+   * it is written when it CHANGES, plus a slow refresh (one write per 2^16
+   * clocks, ~0.9 ms) so that a value the OS clobbers through its own port is
+   * still put back. The
    * collision window goes from one clock in four to one in sixty-five thousand,
    * and an unchanged session writes the table about a thousand times in ten
    * minutes instead of eleven billion. */
+  /* ... AND THE REFRESH IS HELD OFF WHILE THE HOST IS READING THE SLOT
+   * (2026-11-07).
+   *
+   * `mf_datatable` is a true dual-port altsyncram with independent clocks and
+   * no read-during-write bypass, so a host read that lands on the same clock as
+   * one of these writes returns a value the core never chose -- and word 3 is
+   * the SIZE the OS opens the `.sav` at. The refresh was already cut to one
+   * write in 65,536 for that reason, but the exposure is proportional to how
+   * long the flush lasts: an 8 KB save-out is ~18 refresh periods, a 2 MB one
+   * is ~670, which is the only thing in this path that differs by cart size.
+   * (The card has one of each: `Cubicle Knight.sav` 8,192 bytes perfect, and a
+   * 0-byte `Minicraft.sav` from a 2 MB cart whose flush never wrote.)
+   *
+   * `save_readout` is the slot's own level and is high from `[0080]` until
+   * `[008F]` -- exactly the window in which the OS reads the window and the
+   * table. Suppressing the refresh there still leaves the write-on-change, so a
+   * value the OS needs is never withheld; the periodic write is only there to
+   * put back a value the OS clobbered through its own port, and the OS does not
+   * write the table while it is reading a slot out. */
+  wire dt_quiet = save_readout | sf_prearm;
+
   localparam [15:0] DT_REFRESH = 16'hFFFF;
 
   reg [15:0] dt_tick = 16'h0;
   reg [31:0] dt_last = 32'hFFFF_FFFF;
   reg        dt_wr   = 1'b0;
 
+  /* THE SLOT'S SIZE IS THE FILE'S, AND IT IS THE LEVER (2026-11-09).
+   *
+   * The slot is `nonvolatile: true` (the only way a `.sav` exists at all), so
+   * the OS reads it out at quit and writes the file at exactly this size:
+   * "taking into account any changes the core may have written to the Dataslot
+   * ID/Size Table, in case the file size should be expanded or shrunk". That
+   * is why the tail above shrinks the file instead of only shortening the
+   * core's own write: the platform's read-out obeys the same word. It is also
+   * what makes [0190]/[0192] valid for the slot. */
+  wire [31:0] dt_value = save_slot_size;
+
   always @(posedge clk_74a) begin
     dt_tick <= (dt_tick == DT_REFRESH) ? 16'h0 : dt_tick + 16'd1;
 
-    if ((save_slot_size != dt_last) || (dt_tick == DT_REFRESH)) begin
-      dt_last <= save_slot_size;
+    if (dt_value != dt_last) begin
+      dt_last <= dt_value;
+      dt_wr   <= 1'b1;
+    end else if ((dt_tick == DT_REFRESH) && !dt_quiet) begin
       dt_wr   <= 1'b1;
     end else
       dt_wr   <= 1'b0;
@@ -1037,23 +1533,24 @@ module core_top (
    * The byte order is therefore NOT this word's business: the two bridge stages
    * already cancel, and storing the size natively is what the APF's own
    * reference core does (rtl/core_top_template.v: `datatable_data <= has_save ?
-   * 32'h40_000 : 32'h0`, never reversed). */
-  assign datatable_data = save_slot_size;
+   * 32'h40_000 : 32'h0`, never reversed). The table FSM above stores it the
+   * same way. */
+  assign datatable_data = dt_value;
 
   // ---- save-slot read request/ack --------------------------------------
-  /* THE READ REQUEST IS NOT ADDRESSED TO ONE SLOT (2026-11-02).
+  /* THE SAVE SLOT IS READ IN TWO WAYS (2026-11-04).
    *
-   * This used to require `dataslot_requestread_id == 2`. Only one slot in this
-   * core can be read out at all -- slot 2, the cartridge image -- so the id
-   * test bought nothing and had exactly one failure mode: a `[0080]` whose id
-   * did not match (an index instead of an id, a slot renumbered in data.json)
-   * answered the host immediately through the tie-off below, armed nothing, and
-   * left the OS walking 2 MB of a window that answers zero. That is a 100%-zero
-   * `.sav` with the correct size, which is every `.sav` on the panel's card.
-   *
-   * Slot 1 is not readable (it is not nonvolatile), so arming the image stream
-   * for any read request can only ever be the save slot. */
-  wire ps_req_read  = dataslot_requestread;
+   * It is still slot id 2, and `[0080]` still names it. On a flash or EEPROM
+   * cart it holds the cartridge image, which lives in PSRAM, so the read has
+   * to arm rtl/gt_save_slot.sv's stream and wait for its first word. On a
+   * RAM32K cart it holds the 32 KB array, which is always resident and sits
+   * directly on the bridge, so the read is acked at once and served by the
+   * window. An unknown id is acked immediately too, exactly like a
+   * nonvolatile slot that has nothing to stream. */
+  wire save_req_read = dataslot_requestread &&
+                       (dataslot_requestread_id == 16'd2) &&
+                       !ram32k_s;
+  wire ps_req_read  = save_req_read;
   /* ... AND THE WRITE DIRECTION IS NOT ADDRESSED TO ONE SLOT EITHER
    * (2026-11-02). `ps_req_write` was `dataslot_requestwrite && id == 2`, and it
    * armed two things that both fail COMPLETELY when it is false: `ps_slot2_seen`
@@ -1065,6 +1562,98 @@ module core_top (
   wire [31:0] ps_bridge_rdata;
   wire        ps_ack, ps_underrun;
   wire        ps_mem_rd, ps_mem_busy;
+
+  /* ---- the RAM32K save RAM, inside the Save slot -----------------------
+   *
+   * The console side comes up through rtl/gametank.sv; the bridge side is the
+   * SAME window as the image (0x0200_0000), because on a RAM32K cart the Save
+   * slot holds this array instead of the image. It needs no stream and no ack
+   * beyond the one `[0080]` already gets: rtl/gt_nvram.sv reads the addressed
+   * word every clock, so the bridge's four-cycle address-to-sample window is
+   * already covered. On every other cart the window belongs to
+   * rtl/gt_save_slot.sv and this array is never selected. */
+  /* AN OLD IMAGE `.sav` IS NOT AN SRAM IMAGE (2026-11-04).
+   *
+   * Before this build, every GameTank save was the cartridge image, so a
+   * RAM32K game on the card already has a 2 MB `<rom>.sav` next to it. That
+   * file is now loaded into 0x0200_0000 too -- and on a RAM32K cart that
+   * window is the 32 KB array, whose address is only `bridge_addr[14:2]`.
+   * The stream would wrap every 32 KB and leave the array holding an
+   * arbitrary slice of the cartridge, which the game reads as a corrupt
+   * save.
+   *
+   * The slot's own `[0082]` says how many bytes are coming, so the array
+   * accepts the transfer only when that is no larger than the part: a real
+   * SRAM save is exactly 32 KB, and an image save is refused whole rather
+   * than truncated (its first 32 KB are the cartridge's entry code, not
+   * SRAM). The OS reads the size table back when it flushes, so the stale
+   * file is rewritten at 32 KB on the first clean quit. */
+  wire        nv_size_ok  = (dataslot_requestwrite_size <= 32'd32768);
+  wire        nv_bridge_we = slot2_hit && ram32k_s && nv_size_ok;
+
+  /* ... AND THE CONSOLE WAITS FOR IT, AS IT DOES FOR THE IMAGE (2026-11-04).
+   *
+   * On a flash cart the restore is pushed through the download FIFO, so
+   * `dl_stream`/`dl_wait` hold the machine in reset for the length of the
+   * transfer and the game boots from a complete save. The SRAM path does not
+   * touch that FIFO -- the bytes go straight to rtl/gt_nvram.sv -- so nothing
+   * held the console: the game's first instructions could run while the 32 KB
+   * was still arriving and read a half-restored save.
+   *
+   * `nv_loading` is raised by the Save slot's own `[0082]` (after the
+   * cartridge has been identified) and lowered when the declared number of
+   * bytes has been accepted. The timeout is deliberately two different
+   * lengths: 2^24 clk_74a (~226 ms) BEFORE the first word, because the host
+   * still has to read the file off the card after acknowledging the request,
+   * and 2^20 (~14 ms) between words once the stream is moving. Either way a
+   * transfer that stops releases the console, so a bad load cannot leave a
+   * black screen. A refused old image save (`nv_size_ok` false) never raises
+   * it: that data is ignored, and the game should boot on the zeroed array
+   * instead of waiting for it. */
+  wire        nv_req    = dataslot_requestwrite &&
+                          (dataslot_requestwrite_id == 16'd2) &&
+                          ram32k_s && nv_size_ok;
+  wire [15:0] nv_len    = dataslot_requestwrite_size[15:0];
+
+  reg         nv_loading = 1'b0;
+  reg  [15:0] nv_seen    = 16'd0;         // accepted bytes of this transfer
+  reg  [23:0] nv_idle    = 24'd0;         // clk_74a since the last accepted word
+  wire [23:0] nv_limit   = (nv_seen == 16'd0) ? 24'hFF_FFFF : 24'h0F_FFFF;
+
+  always @(posedge clk_74a) begin
+    if (~reset_n || external_reset) begin
+      nv_loading <= 1'b0;
+      nv_seen    <= 16'd0;
+      nv_idle    <= 24'd0;
+    end else if (nv_req) begin
+      nv_loading <= 1'b1;
+      nv_seen    <= 16'd0;
+      nv_idle    <= 24'd0;
+    end else if (nv_loading) begin
+      if (nv_bridge_we) begin
+        nv_seen <= nv_seen + 16'd4;
+        nv_idle <= 24'd0;
+      end else if (nv_idle != nv_limit) begin
+        nv_idle <= nv_idle + 24'd1;
+      end
+
+      if ((nv_seen + (nv_bridge_we ? 16'd4 : 16'd0)) >= nv_len)
+        nv_loading <= 1'b0;
+      else if (nv_idle == nv_limit)
+        nv_loading <= 1'b0;
+    end
+  end
+
+  // The hold is a level into the machine's clock; two flops, like ram32k.
+  reg nv_load_c1 = 1'b0, nv_load_c2 = 1'b0;
+  always @(posedge clk_core) begin
+    nv_load_c1 <= nv_loading;
+    nv_load_c2 <= nv_load_c1;
+  end
+  wire [14:0] nvram_addr;
+  wire        nvram_wr;
+  wire [7:0]  nvram_wdata;
+  wire [7:0]  nvram_q;
   wire [21:0] ps_mem_addr;
   wire [7:0]  ps_mem_burstcnt;
   wire [63:0] ps_mem_dout;
@@ -1113,7 +1702,15 @@ module core_top (
       .req          (ps_req_read),
       .allcomplete  (dataslot_allcomplete),
       .pre_arm      (sf_prearm),
+      .file_arm     (sf_slot_arm),      // the core's own writer, no ack
+      .file_start   (sf_slot_start),    // ... from this image word
+      .tail_en      (sv_tail_q),        // the file is [head][tail], not the image
+      .tail_word    (sv_tword_q),       // ... from this image word
+      .empty        (sv_empty_q),       // nothing saved: zero words
       .ack          (ps_ack),
+      .readout      (save_readout),
+      .hold_console (ss_hold_console),
+      .win_words    (ss_win_words),
 
       .bridge_addr  (bridge_addr),
       .bridge_rd    (bridge_rd),
@@ -1152,6 +1749,122 @@ module core_top (
       .underrun     (ps_underrun)
   );
 
+  /* ---- the core's own save file ----------------------------------------
+   *
+   * The $90 pulse is 35 ns wide in the console's clock; two flops here and the
+   * edge detector inside the module are what make that a reliable trigger. */
+  reg [1:0] sf_trig_s = 2'b00;
+  always @(posedge clk_74a)
+    sf_trig_s <= {sf_trig_s[0], save_trig_ok};
+
+  assign sf_rd_hit = (bridge_addr[31:24] == 8'h03);
+
+  gt_save_file sfile (
+      .clk         (clk_74a),
+      .reset       (~core_ready_c2),
+
+      .trig        (sf_trig_s[1]),
+      .inmenu      (osnotify_inmenu),
+      .have_img    (cart_size != 22'd0),
+      .img_bytes   (save_slot_size),
+      // THE WINDOW IS ALREADY THE FILE (2026-11-09). It is the head plus the
+      // tail, i.e. exactly the bytes the OS reads at quit, and it is small -- so
+      // this writer writes all of it and neither a span nor a launch-load
+      // vouching for the file can make it wrong. `known` low is that statement:
+      // every save is a full write of `save_slot_size` bytes from word 0.
+      .file_ok     (1'b0),
+      .span_ok     (1'b0),
+
+      .span_req    (sf_span_req),
+      .span_ack    (sf_span_ack_s[1]),
+      .span_lo     (sf_span_lo),
+      .span_hi     (sf_span_hi),
+      .span_any    (sf_span_any),
+
+      .slot_arm    (sf_slot_arm),
+      .slot_start  (sf_slot_start),
+      .slot_thresh (sf_slot_thresh),
+      .slot_full   (sf_slot_full),
+
+      .bridge_addr (bridge_addr),
+      .bridge_rd   (bridge_rd),
+      .rd_data     (sf_rd_data),
+      .bridge_wr   (bridge_wr),
+      .bridge_wr_data (bridge_wr_data),
+
+      .t_write      (sf_t_write),
+      .t_read       (sf_t_read),
+      .t_getfile    (sf_t_getfile),
+      .t_openfile   (sf_t_openfile),
+      .t_flush      (sf_t_flush),
+      .t_id         (sf_t_id),
+      .t_slotoffset (sf_t_slotoffset),
+      .t_bridgeaddr (sf_t_bridgeaddr),
+      .t_length     (sf_t_length),
+      .t_param_struct(sf_t_param),
+      .t_resp_struct (sf_t_resp),
+      .t_done       (sf_t_done),
+      .t_err        (sf_t_err),
+
+      .busy        (sf_busy),
+      .done        (sf_done),
+      .failed      (sf_failed),
+
+      .load_req    (sf_load_req),
+      .load_busy   (sf_load_busy),
+      .load_done   (sf_load_done)
+  );
+
+  /* ---- the RAM32K save RAM, on both sides ------------------------------
+   *
+   * The 32 KB array is shared by the 6502 (two 16 KB banks at $8000-$BFFF,
+   * decoded in rtl/cart.sv) and by the OS's Save slot (0x0200_0000, this
+   * window) when the cart is a RAM32K. gt_nvram is a true dual-port RAM: the
+   * CPU side is one byte per access, the Pocket side one 32-bit word, and
+   * both outputs are registered. The bridge holds the address for four clocks
+   * before it samples, so a continuously registered read at `bridge_addr`
+   * answers it without a handshake. */
+  gt_nvram nvram (
+      .clk_core   (clk_core),
+      .cpu_addr   (nvram_addr),
+      .cpu_q      (nvram_q),
+      .cpu_we     (nvram_wr),
+      .cpu_wdata  (nvram_wdata),
+
+      .clk_74a    (clk_74a),
+      .ap_addr    (bridge_addr[14:2]),
+      .ap_q       (nv_bridge_rdata),
+      .ap_we      (nv_bridge_we),
+      .ap_wdata   (bridge_wr_data),
+      // A new cartridge starts from a fresh part: the previous game's SRAM
+      // must never be read (or flushed) as this one's save. The clear runs
+      // with the machine held by the cartridge download; see rtl/gt_nvram.sv.
+      .clr        (cart_new)
+  );
+
+  /* THE CORE WRITES THE SAVE ITSELF, FOR LATENCY AND NOT FOR CORRECTNESS
+   * (2026-11-07).
+   *
+   * The platform's writeback is the mechanism that works -- it reads the image
+   * out of the Save slot at exit and writes the .sav, and it is the path this
+   * core relies on. What it cannot do is be quick: measured at the APF's own
+   * pace, a 2 MB image is 649.6 ms of host reading plus the OS's card writes, and
+   * all of it happens with the console already being torn down. So a save that
+   * a game commits mid-session is not on the card until the player quits.
+   *
+   * rtl/gt_save_file.sv closes that gap: on the game's own save event it walks
+   * the image out through the host's [0184 in chunks the slot can actually keep
+   * fed, then flushes the card with [0188. It is not a second source of truth --
+   * the platform's exit writeback still lands on the .sav exactly as it did, so
+   * a writer that gives up (it has timeouts, and latches `failed` rather than
+   * retrying for ever) costs nothing but the early copy.
+   *
+   * It was removed on 2026-11-03 for the reason recorded below, and it is back
+   * because the shutdown hang that killed it -- a `cm` marker standing in the
+   * framework's target register while the OS closes the core -- is now handled
+   * in rtl/core_bridge_cmd.v: a reset drops whatever is in flight (error 7) and
+   * clears the queues, so nothing of ours is left pointing at a core that is
+   * about to be reconfigured. */
   /* ONE SAVE MECHANISM: THE PLATFORM'S (2026-11-03).
    *
    * There used to be a second one here -- rtl/gt_save_file.sv, which wrote
@@ -1163,10 +1876,12 @@ module core_top (
    * WHY REMOVED AND NOT JUST DISABLED. Every command it could still issue was a
    * `cm` marker in the framework's target register, and a core holding one of
    * those while the OS closes it is a core the framework will not close -- the
-   * black screen at quit, by the framework's own rules. A GameTank has no
-   * battery-backed RAM: a save IS the cartridge image, and the OS already reads
-   * that image out of the Save data slot at exit and writes it back at launch.
-   * One mechanism, the documented one, and nothing of this core's on the target
+   * black screen at quit, by the framework's own rules. A flash GameTank cart
+   * has no battery-backed RAM: its save IS the cartridge image, and the OS
+   * already reads that image out of the Save data slot at exit and writes it
+   * back at launch. (A RAM32K cart does have 32 KB of SRAM; that is the Save
+   * slot's other content, the array below, not a second file writer.) One
+   * mechanism, the documented one, and nothing of this core's on the target
    * channel.
    *
    * WHAT IS LOST: a save is committed when the core is quit, not at the instant
@@ -1240,7 +1955,10 @@ module core_top (
        * Boot Process, Shutdown), so the OS is sitting in the command waiting for
        * this handshake, not doing anything with the answer. A PSRAM that never
        * answers is still covered by the stream's own 0.88 ms ack cap. */
-      .dataslot_requestread_ack(ps_ack),
+      // The Save slot waits for its stream's first word when it holds the
+      // image; on a RAM32K cart the array is always resident, so its ack is
+      // immediate -- and so is any id this build does not know.
+      .dataslot_requestread_ack(save_req_read ? ps_ack : 1'b1),
       .dataslot_requestread_ok (1'b1),
 
       .dataslot_requestwrite    (dataslot_requestwrite),
@@ -1305,17 +2023,22 @@ module core_top (
       // the Save slot, and there is no second mechanism left to issue
       // [0184]/[0192] at. That matters most at quit -- a `cm` marker standing
       // in `target_0` while the OS closes the core is a core it will not close.
-      .target_dataslot_read      (1'b0),
-      .target_dataslot_write     (1'b0),
-      .target_dataslot_getfile   (1'b0),
-      .target_dataslot_openfile  (1'b0),
-      .target_dataslot_flush     (1'b0),
-      .target_dataslot_id        (16'h0),
-      .target_dataslot_slotoffset(32'h0),
-      .target_dataslot_bridgeaddr(32'h0),
-      .target_dataslot_length    (32'h0),
-      .target_buffer_param_struct(32'h0),
-      .target_buffer_resp_struct (32'h0),
+      // THE FILE COMMANDS ARE THE CORE'S OWN AGAIN (2026-11-07): rtl/gt_save_file.sv
+      // writes the image out on the game's save event and reads it back at
+      // launch, so all five are driven by it rather than tied off.
+      .target_dataslot_read      (sf_t_read),
+      .target_dataslot_write     (sf_t_write),
+      .target_dataslot_getfile   (sf_t_getfile),
+      .target_dataslot_openfile  (sf_t_openfile),
+      .target_dataslot_flush     (sf_t_flush),
+      .target_dataslot_id        (sf_t_id),
+      .target_dataslot_slotoffset(sf_t_slotoffset),
+      .target_dataslot_bridgeaddr(sf_t_bridgeaddr),
+      .target_dataslot_length    (sf_t_length),
+      .target_dataslot_done      (sf_t_done),
+      .target_dataslot_err       (sf_t_err),
+      .target_buffer_param_struct(sf_t_param),
+      .target_buffer_resp_struct (sf_t_resp),
 
       .datatable_addr(datatable_addr),
       .datatable_wren(datatable_wren),
@@ -1338,7 +2061,7 @@ module core_top (
   // domain into a small gray-pointer FIFO, drain in the machine's domain, and
   // count drops so an incomplete image is a number, not a mystery.
 
-  wire slot1_write = bridge_wr && (bridge_addr[31:28] == 4'h1);
+  wire slot1_write = slot1_hit;
 
   /* THE SAVE SLOT'S BYTES ARE THE CARTRIDGE IMAGE, SO THEY LAND WHERE THE IMAGE
    * LANDS (2026-10-31).
@@ -1370,11 +2093,54 @@ module core_top (
    * Only the size inference must stay slot-1's (`dl_img_size`, above): a 2 MB
    * .sav written over a 32 KB EEPROM game must not turn it into a flash cart.
    */
-  wire slot2_write = bridge_wr && (bridge_addr[31:24] == 8'h02);
+  // On a RAM32K cart the bytes at 0x02 are the 32 KB SRAM, not an image, so
+  // they go straight to rtl/gt_nvram.sv and never enter the probe below.
+  wire slot2_write = slot2_hit && !ram32k_s;
 
   // Bytes of image restored through the save slot, for the harnesses and the
   // debug tag: a save that arrives and is not counted is a save that did not.
-  reg [21:0] save_bytes /* verilator public_flat_rd */ = 22'd0;
+  reg  [21:0] save_bytes /* verilator public_flat_rd */ = 22'd0;
+
+  /* ---- IS THE FILE ON THE CARD THIS IMAGE? (2026-11-08) -----------------
+   *
+   * The span write in rtl/gt_save_file.sv is only safe while the `.sav` holds
+   * the same bytes as the image; otherwise the bytes outside the span would
+   * stay as whatever the file had. At launch the OS loads the slot's file INTO
+   * the core ([0082] + the bytes + [008F]), so a load whose declared size is the
+   * cartridge's own size, and that the probe above accepted whole, leaves the
+   * image and the file identical -- and that is exactly what this records.
+   *
+   * A save file that does not exist is never loaded, so no [0082] arrives for
+   * slot 2 and this stays low: the first save writes the whole image. A file of
+   * another size, a refused restore (the probe drops it), and a different
+   * cartridge all leave it low for the same reason -- the file is not known to
+   * be the image, so the writer may not assume it is. */
+  reg         sf_open2  = 1'b0;
+  reg  [21:0] sf_req_size = 22'd0;
+  reg  [15:0] sf_refused  = 16'd0;
+  reg  [31:0] sf_size_q   = 32'hFFFF_FFFF;
+  reg         sf_file_ok  = 1'b0;
+
+  always @(posedge clk_74a) begin
+    if (req_start && (dataslot_requestwrite_id == 16'd2)) begin
+      sf_open2      <= 1'b1;
+      sf_req_size   <= dataslot_requestwrite_size[21:0];
+      sf_refused    <= save_refused;
+      sf_file_ok    <= 1'b0;
+    end
+    // A different cartridge is a different .sav, whatever the last one was.
+    if (save_slot_size != sf_size_q) begin
+      sf_size_q  <= save_slot_size;
+      sf_file_ok <= 1'b0;
+    end
+    if (dataslot_allcomplete) begin
+      if (sf_open2 && (sf_req_size == save_slot_size[21:0]) &&
+          (save_refused == sf_refused) && (save_slot_size != 32'd0))
+        sf_file_ok <= 1'b1;
+      sf_open2 <= 1'b0;
+    end
+  end
+
 
   /* A SAVE THAT IS NOT AN IMAGE MUST NEVER BE RESTORED (2026-10-31).
    *
@@ -1434,7 +2200,6 @@ module core_top (
   reg  [2:0]  sv_rp    = 3'd0;             // replay cursor
   reg  [3:0]  sv_bad   = 4'd0;             // ... of which these did not match (four
                                            // bits: eight mismatches is 8, not 0)
-  reg  [19:0] sv_quiet = 20'd0;            // clk_74a since the last slot-2 word
   reg  [15:0] save_refused = 16'd0;
 
   /* THE CARTRIDGE'S OWN FIRST WORDS. Captured from slot 1 as it streams in,
@@ -1446,8 +2211,25 @@ module core_top (
   reg  [3:0]  ch_idx   = 4'd0;             // four bits: three cannot hold 8
   reg         ch_ok    = 1'b0;
 
+  /* A REQUEST'S LEVEL LINGERS; ITS START IS THE EDGE (2026-11-04).
+   *
+   * [0082] sets `dataslot_requestwrite` and the command FSM clears it only
+   * when it returns to idle, clocks after the ack -- the same note the size
+   * capture above makes. Resetting these counters on the LEVEL therefore
+   * discards every slot word that arrives while it is still high: the
+   * cartridge's first words never reach `ch_data`, so the probe compares a
+   * save against a shifted head and refuses every restore for that boot
+   * (silently: the game just boots without its save), or the save probe
+   * restarts mid-stream. Both are captures that must begin once, at the
+   * request, and then run to their own end. */
+  reg  req_seen  = 1'b0;
+  wire req_start = dataslot_requestwrite && !req_seen;
+
+  always @(posedge clk_74a)
+    req_seen <= dataslot_requestwrite;
+
   always @(posedge clk_74a) begin
-    if (dataslot_requestwrite)
+    if (req_start)
       ch_idx <= 4'd0;
     else if (slot1_write && (ch_idx < SV_PROBE)) begin
       ch_data[ch_idx[2:0]] <= bridge_wr_data;
@@ -1459,7 +2241,19 @@ module core_top (
 
   wire        sv_live   = slot2_write && (sv_st == SV_PASS);
   wire        sv_replay = (sv_st == SV_REPLAY);
-  wire [20:0] cf_waddr  = sv_replay ? sv_haddr[sv_rp] : bridge_addr[20:0];
+
+  /* A SHORTER FILE'S OFFSETS ARE NOT THE IMAGE'S (2026-11-09). Its first 32
+   * bytes are the cartridge's head and everything after them starts at the
+   * tail's base, so a restore lands where the save actually lives instead of
+   * over the cartridge's entry code. A raw file (size >= the image) leaves the
+   * offsets exactly as they were. */
+  wire [20:0] cf_waddr_sv = (sv_load_tail && (bridge_addr[20:0] >= 21'd128))
+                          ? (sv_load_lo[20:0] + (bridge_addr[20:0] - 21'd128))
+                          : bridge_addr[20:0];
+
+  wire [20:0] cf_waddr  = sv_replay ? sv_haddr[sv_rp]
+                        : sv_live    ? cf_waddr_sv
+                        :              bridge_addr[20:0];
   wire [31:0] cf_wdata  = sv_replay ? sv_hdata[sv_rp] : bridge_wr_data;
 
   always @(posedge clk_74a) begin
@@ -1485,15 +2279,12 @@ module core_top (
      * `[0082]` is the OS saying a download starts. Nothing can be in flight
      * across it, so discarding what the probe held costs nothing and makes the
      * bytes under test the ones that were actually sent. */
-    else if (dataslot_requestwrite) begin
+    else if (req_start) begin
       sv_st   <= SV_IDLE;
       sv_hidx <= 3'd0;
       sv_bad  <= 4'd0;
     end
     else begin
-      if (slot2_write) sv_quiet <= 20'd0;
-      else if (sv_quiet != 20'hF_FFFF) sv_quiet <= sv_quiet + 20'd1;
-
       case (sv_st)
       /* THE PROBE STARTS ON THE STREAM'S FIRST WORD, NOT ON A COMMAND
        * (2026-11-02). It used to start on `sv_start`, i.e. a `[0082]` whose
@@ -1535,20 +2326,29 @@ module core_top (
         else                         sv_rp <= sv_rp + 3'd1;
       end
 
-      /* ONE TRANSFER ENDS ON SILENCE, NOT ON A COMMAND (2026-11-02).
+      /* A RESTORE ENDS ON THE HOST SAYING SO, NOT ON A PAUSE (2026-11-05).
        *
-       * `[008F]` is what a launch sends at the end of the slots. A manual load
-       * sends none -- and the boot's own `[008F]` is STILL HIGH when the button
-       * is pressed, because only `[0080]`/`[0082]` clear it, so ending on it
-       * would return to SV_IDLE on the very first clock of the very first
-       * restore. A state machine that can only leave through a command nobody
-       * sent never probes twice.
+       * This used to leave on 2^20 clk_74a (14 ms) with no slot-2 write, on the
+       * argument that a gap between two chunks of one restore is never that
+       * long. It is. The OS does not stream a .sav in one burst: it reads a
+       * chunk off the card, writes it into this window, and comes back -- and a
+       * card that has to retry, or a progress redraw between chunks, is tens of
+       * milliseconds. Measured in sim/gt/tb_core_ss.cpp: a single 1.2 M-tick
+       * pause at a quarter of the image left `save_bytes` at 8,196 of 32,768.
+       * Everything after the pause left SV_PASS, so `sv_live` went false and
+       * the rest of the file was DROPPED -- a save the card says is there, half
+       * restored, with no error anywhere. That is the 2026-11-02 failure
+       * (window disarmed itself on silence) in the other direction.
        *
-       * 2^20 clk_74a is 14 ms against a bridge access every ~1.2 us, so a gap
-       * between two chunks of the same restore is never mistaken for the end of
-       * it -- and re-probing mid-image would replay the held words at the wrong
-       * offset, i.e. an image restored with its head shifted. */
-      SV_PASS, SV_DROP: if (sv_quiet == 20'hF_FFFF) begin
+       * `[008F]` is what ends it, and it is a level that only `[0080]`/`[0082]`
+       * clear -- so a manual load pressed while it is still high from the boot
+       * is covered by its own `[0082]`, which drops the FSM to SV_IDLE below
+       * before the first byte arrives. `req_start` is therefore what makes this
+       * safe: EVERY download begins with a `[0082]`, and that re-arms the probe
+       * no matter what the previous session left behind. A stream that never
+       * sends `[008F]` (a manual load) simply stays passing, which is the state
+       * that forwards bytes -- the failure mode is "keeps working", not "stops". */
+      SV_PASS, SV_DROP: if (dataslot_allcomplete) begin
         sv_st   <= SV_IDLE;
         sv_hidx <= 3'd0;
         sv_bad  <= 4'd0;
@@ -1561,6 +2361,70 @@ module core_top (
 
   wire cf_push      = slot1_write || sv_live || sv_replay;
   wire cf_push_save = sv_live || sv_replay;
+
+  /* ---- the base of the tail, in the host's own clock -------------------
+   *
+   * Two sources, and the lower one wins for the rest of the session:
+   *
+   *   * the file the OS just loaded, whose size says where its tail begins
+   *     (`sv_lo = cart_size - (size - 32)`), and
+   *   * the game's own writes since the cartridge was loaded, through
+   *     rtl/cart.sv's `worm_lo`.
+   *
+   * The loaded base has to be taken at the slot's `[0082]`, before its bytes
+   * arrive, because that is what the restore's offsets are measured from.
+   * `sv_load_*` is that transfer's mapping; it is left standing afterwards
+   * (there is only ever one boot restore) and is what `cf_waddr` below uses.
+   *
+   * Crossing: `worm_lo` only falls, so a torn sample can only be lower than the
+   * truth -- which costs a few extra bytes in the file, never a changed byte
+   * left out. The opposite mistake is the one that would eat a save. */
+  wire [21:0] sv_req_size  = dataslot_requestwrite_size[21:0];
+  wire        sv_pack_load = (dataslot_requestwrite_id == 16'd2) && !ram32k_s &&
+                             (cart_size > 22'h10_0000) &&
+                             (sv_req_size > 22'd128) &&
+                             (sv_req_size < {1'b0, cart_size}) &&
+                             (sv_req_size[2:0] == 3'b000);
+  wire [21:0] sv_pack_lo   = {1'b0, cart_size} - (sv_req_size - 22'd128);
+
+  reg  [1:0]  sv_req_q    = 2'b00;
+  reg  [20:0] worm_lo_s1  = 21'h1F_FFFF, worm_lo_s2 = 21'h1F_FFFF;
+  reg         worm_any_s1 = 1'b0,        worm_any_s2 = 1'b0;
+
+  always @(posedge clk_74a) begin
+    sv_req_q    <= {sv_req_q[0], dataslot_requestwrite};
+    worm_lo_s1  <= worm_lo;    worm_lo_s2  <= worm_lo_s1;
+    worm_any_s1 <= worm_any;   worm_any_s2 <= worm_any_s1;
+
+    if (cart_new) begin
+      sv_lo        <= IMG_END;
+      sv_load_lo   <= 22'h0;
+      sv_load_tail <= 1'b0;
+      sv_saw_req   <= 1'b0;
+      sv_head_ok   <= 1'b0;
+      sv_win_seen  <= 1'b0;
+    end
+    else begin
+      /* Independent of the two below, not a branch of them: a bridge write and
+       * a [0082] can land on the same clock, and making this an `else if` would
+       * swallow that request edge for the rest of the session. */
+      if (slot2_hit)
+        sv_win_seen <= 1'b1;           // see its declaration: a delivery
+
+      if (dataslot_requestwrite && !sv_req_q[1] &&
+          (dataslot_requestwrite_id == 16'd2)) begin
+        sv_saw_req   <= 1'b1;
+        sv_head_ok   <= (sv_req_size <= 22'd128);
+        sv_load_tail <= sv_pack_load;
+        sv_load_lo   <= sv_pack_load ? sv_pack_lo : 22'h0;
+        if (sv_pack_load && (sv_pack_lo < sv_lo))
+          sv_lo <= sv_pack_lo;
+      end
+      else if (worm_any_s2 && (({1'b0, worm_lo_s2} & 22'h3F_FFF8) < sv_lo)) begin
+        sv_lo <= {1'b0, worm_lo_s2} & 22'h3F_FFF8;
+      end
+    end
+  end
 
   // 32 entries, not the four Minicube64 needed. GameTank's download drains into
   // PSRAM through a state machine (~5.5 clocks per byte once rtl/cart.sv pairs
@@ -1796,7 +2660,58 @@ module core_top (
    * `reset_n` (which stops the data-slot write handshake waiting for the boot
    * gate) and drops any target marker the core might be holding. The machine is
    * not touched. */
-  wire pause_req = pause_user | menu_pause;
+  /* THE READ-OUT OWNS THE MEMORY PORT WHILE IT RUNS (2026-11-05, corrected
+   * 2026-11-06 by what the card did).
+   *
+   * The save slot's stream is a PSRAM read (rtl/gt_save_slot.sv) and the
+   * console is a PSRAM read too (rtl/cart.sv's bank cache, rtl/gram.sv's row
+   * prefetcher) off the same chip. `rtl/mem_bus.sv` gives the save slot the
+   * first turn of every arbitration, but a turn is a sixteen-beat burst: while
+   * the console is mid-burst the stream waits for it, and while the CPU is
+   * fetching code it asks again immediately. Measured in sim/gt/tb_slot.cpp,
+   * the stream alone is 24.3 clk_core per 8-byte beat (9.4 MB/s) and the host
+   * reads a word every ~80 clk_74a (3.7 MB/s) -- a 2.5x margin that sharing
+   * the port halves.
+   *
+   * So the CPU is HELD for the `[0010]` window and for the whole read-out. Not
+   * reset: `pause` only takes the CPU's clock enable (rtl/gametank.sv, `cpu_ce`),
+   * so the machine stops where it is and resumes when the host lets go, and
+   * rtl/gt_video.sv's raster is not this signal's to stop -- it holds the last
+   * frame, which is what a console looks like at quit anyway.
+   *
+   * `sf_prearm` ALONE WAS NOT ENOUGH, AND THAT IS WHAT THE CARD SHOWED
+   * (2026-11-06). It covers `[0010 Reset Enter]`, but the OS closes that with
+   * `[0011]` before it sends `[0080]`, so the machine was live for the transfer
+   * itself -- still executing, still fetching code out of the same PSRAM. A
+   * saved file from the card reads as one image word in four: the host, the CPU,
+   * rtl/gram.sv's row prefetcher and rtl/blitter.sv were sharing the port four
+   * ways, which is also why the ack's 0.88 ms deadline expired with only ~60
+   * words resident instead of 240. `save_readout` (rtl/gt_save_slot.sv) is the
+   * level that says the host is actually reading, and holding the CPU for it is
+   * what restores the measured margin: sim/gt/tb_cart_ss.cpp's `GT_SAVE_LIVE=1`
+   * runs the transfer with the cartridge executing, and the file is
+   * byte-identical at the APF's pace and at 2.6x it.
+   *
+   * The remaining consumer is the row prefetcher, which is not this signal's to
+   * stop -- it fetches about a megabyte a second against the stream's nine, so
+   * it costs headroom rather than the margin. */
+  /* THE HOLD ENDS WHEN THE STREAM STOPS NEEDING THE PORT (2026-11-07).
+   *
+   * It was `sf_prearm | save_readout` -- the console paused for the whole
+   * read-out. Measured in sim/gt/tb_core_ss.cpp at the APF's own pace, a 2 MB
+   * save is 649.6 ms of read-out with the picture stopped for 100% of it, and
+   * the OS's card writes come on top of that. The reason for the hold is
+   * PSRAM contention (`save_readout`'s note above), and contention only exists
+   * while the stream is fetching: with the window full it is parked and the
+   * port is idle.
+   *
+   * So the slot decides, from the window's own occupancy, and this is the
+   * permissive direction of that decision: whenever the slot asks, the CPU is
+   * held exactly as before; the console only gains the microseconds where the
+   * slot has nothing to ask for. */
+  wire save_stream = sf_prearm | (save_readout & ss_hold_console);
+
+  wire pause_req = pause_user | menu_pause | save_stream;
 
   // ---- into the machine's clock ----
   reg [1:0] pause_s = 2'b0;
@@ -1815,6 +2730,127 @@ module core_top (
   wire [ 7:0] cart_data;
   wire        dl_busy, dl_wait;
   wire [21:0] cart_size;
+
+  /* WHICH MOMENT MAY ASK FOR A FILE, AND WHICH MUST NOT (2026-11-09).
+   *
+   * The cartridge stream ending (`dl_wait` falling) used to arm the restore,
+   * and that is one slot too early: the framework loads the slots IN ORDER, so
+   * the `.sav` is still coming when the cartridge's last byte lands. Issuing a
+   * target command there puts a `cm` in `target_0` while the framework is still
+   * streaming, and the request that was supposed to come next is the one it has
+   * already been told about. The boot stalls exactly the way the panel reported.
+   *
+   * `[008F Data slot access all complete]` is the framework saying it is done
+   * with every slot, and Analogue's Core Boot Process has it as the step before
+   * `[0140]`: "Core may still request more slot ops" from that point on. Its
+   * RISING EDGE, then, and nothing earlier. It is a level that stays high for
+   * the rest of the session, so the edge is the event.
+   *
+   * AND IT ASKS NOTHING IF THE SLOT WAS DELIVERED. `slot2_seen` is any bridge
+   * write into the Save slot's window during this launch (0x02xxxxxx, which is
+   * the framework copying the `.sav` in). When that happened the image already
+   * IS the save, the card has been read once, and a restore would read the same
+   * bytes back a second time -- from the file this core last wrote, on a
+   * cartridge whose `[0190]` name may not even resolve. So it is not run.
+   *
+   * `sf_boot_done` makes it once per cartridge. `cart_new` (the first word of a
+   * new image) clears the lot, so a cartridge chosen from the menu is restored
+   * on its own terms rather than inheriting the last one's. */
+  reg  [1:0] sf_ac_s      = 2'b00;   // [008F], sampled in clk_74a
+  reg        sf_boot_done = 1'b0;    // ... dealt with for this cartridge
+  reg        sf_load_pend = 1'b0;    // ... armed, and waiting out the boot
+  reg        sf_load_ev   = 1'b0;    // one clk_74a cycle
+  reg        slot2_seen   = 1'b0;    // the OS put the .sav in itself this launch
+  reg [27:0] sf_settle    = 28'd0;   // ... the wait above, in clk_74a
+
+  /* THE REQUEST IS NOT THE SAME CYCLE AS `[008F]` (2026-11-09).
+   *
+   * Asked on the edge itself, the restore's `[0190]` went out while the
+   * framework was still finishing its boot, and the panel answered with
+   * "error in framework: core not ready to run" -- twice, and only ever on the
+   * configs where the framework had NOT loaded the slot itself. A core that
+   * asks for a file in that window is a core the framework is still waiting to
+   * see become ready.
+   *
+   * `[008F]` is followed by the RTC, by `[0140]` and by the framework moving the
+   * core to [Running] (Analogue, Core Boot Process, steps 12-16). Those are
+   * milliseconds, so this waits a quarter of a second -- `SF_SETTLE` -- with the
+   * console already held, and asks after that. The cost is a dark screen at
+   * boot, which a stock core also has; the alternative is a core that does not
+   * start at all. In sim the wait is shortened by `GT_SIM_QUICK_BOOT`; the
+   * ordering, which is what this is for, is the same either way. */
+`ifdef GT_SIM_QUICK_BOOT
+  localparam [27:0] SF_SETTLE = 28'd2000;            // sim: the ordering only
+`else
+  localparam [27:0] SF_SETTLE = 28'd18_562_500;      // 250 ms at 74.25 MHz
+`endif
+
+  always @(posedge clk_74a) begin
+    sf_ac_s <= {sf_ac_s[0], dataslot_allcomplete};
+
+    /* ... AND THE DECLARATION IS ENOUGH, NOT JUST THE BYTES (2026-11-09).
+     *
+     * This used to mean "a byte landed at 0x02xxxxxx". A 0-byte `.sav` has no
+     * bytes to land, so the slot looked ABSENT, and the fallback below asked
+     * the host for a file the framework had already delivered -- one `[0190]`
+     * and an open, on every boot of a cartridge whose save is empty, with the
+     * console held through `SF_SETTLE` for nothing. `sv_saw_req` is the same
+     * `[0082]`-for-slot-2 edge the size rule uses, and an empty delivery is
+     * still a delivery: the file exists, and it says the image is the `.gtr`. */
+    if (slot2_hit || sv_saw_req)
+      slot2_seen <= 1'b1;
+
+    if (cart_new) begin
+      sf_boot_done <= 1'b0;
+      sf_load_pend <= 1'b0;
+      sf_settle    <= 28'd0;
+      slot2_seen   <= 1'b0;
+    end
+
+    /* AND A `[008F]` WITH NO CARTRIDGE BEHIND IT ARMS NOTHING (2026-11-09).
+     *
+     * `cart_size` is what says a cartridge is loaded at all, and the framework
+     * can send `[008F]` for a data phase that carried no cartridge -- the
+     * harness does it by name. Armed there, the wait below could never complete
+     * (there is no size to wait for) and the console would stay in reset while
+     * the core looked perfectly idle: the save-state engine then never starts
+     * and the panel has a core that runs nothing. So the size is a condition of
+     * ARMING, and a wait that somehow gets nowhere drops its hold instead of
+     * keeping it. */
+    /* ... AND NOT AT ALL ON A CARTRIDGE WHOSE SAVE MAY HAVE A TAIL (2026-11-09).
+     *
+     * This restore reads the .sav itself and drops the bytes into the window at
+     * their FILE offsets, because that is the only mapping it can know: it
+     * learns a file's length by running off the end of it, which is after the
+     * bytes have landed. A tail file's byte 128 is image byte `sv_lo`, not
+     * image byte 128, so that restore would put the save at the wrong addresses -- the
+     * one failure nobody may have. It is also unnecessary there: the slot is
+     * `deferload: false`, so the framework has already streamed the .sav in and
+     * `slot2_seen` is high (the mapping for that path comes from [0082]'s size,
+     * which is exact). If the framework did not deliver it, the game boots from
+     * the cartridge, exactly as it would with no save file, and nothing has
+     * been written over. */
+    if (sf_ac_s[0] && !sf_ac_s[1] && !sf_boot_done && !slot2_seen && !slot2_hit &&
+        (cart_size != 22'd0) && !sf_tail_cart) begin
+      sf_load_pend <= 1'b1;
+      sf_settle    <= 28'd0;
+    end
+
+    sf_load_ev <= 1'b0;
+    if (sf_load_pend) begin
+      if (sf_settle != SF_SETTLE)
+        sf_settle <= sf_settle + 28'd1;
+      else begin
+        sf_load_pend <= 1'b0;            // one shot either way
+        if (!sf_boot_done && (cart_size != 22'd0)) begin
+          sf_boot_done <= 1'b1;
+          sf_load_ev   <= 1'b1;
+        end
+      end
+    end
+  end
+
+  assign sf_load_req = sf_load_ev;
   wire [21:16] cram_a;
   wire [15:0]  cram_dq_out;
   wire         cram_dq_oe;
@@ -1825,11 +2861,76 @@ module core_top (
   wire [15:0] m_audio_l, m_audio_r;
 
   reg core_ready_c1 = 1'b0, core_ready_c2 = 1'b0, dl_wait_c = 1'b0;
+  reg sf_restore_c1 = 1'b0, sf_restore_c2 = 1'b0;
+
+  /* THE CONSOLE WAITS FOR ITS OWN SAVE (2026-11-08).
+   *
+   * `load_busy` is high from the cycle the restore is requested until its last
+   * chunk is back, and never during a save. The restore's own [0180] writes
+   * also raise `dl_wait`, which holds the machine for the whole transfer; this
+   * level closes the few cycles between the request and the first of those
+   * writes, so the game never starts on an image that is about to change.
+   */
+  // ... and the settle above holds it too: the game must not start on an image
+  // that is about to be replaced 250 ms later.
+  wire sf_restore = sf_load_busy | sf_load_pend;
 
   always @(posedge clk_core) begin
     core_ready_c1 <= core_ready;
     core_ready_c2 <= core_ready_c1;
     dl_wait_c     <= dl_wait;
+
+    // The restore's own hold, in this domain: the arming/settle/request levels
+    // are clk_74a signals and the machine's reset is decided here.
+    sf_restore_c1 <= sf_restore;
+    sf_restore_c2 <= sf_restore_c1;
+  end
+
+  /* A STUCK RESTORE MAY NOT HOLD THE CONSOLE FOR EVER (2026-11-09).
+   *
+   * The restore is a fallback, and a fallback that wedges is worse than one
+   * that gives up: the machine never leaves reset, there is no picture change
+   * and the framework has a core that will never run. Every command has its
+   * own timeout in rtl/core_bridge_cmd.v, but a *sequence* of them does not, and
+   * 1,092 chunks is a long sequence.
+   *
+   * So the hold has a ceiling. Past it the console is let out and boots on the
+   * image the framework delivered -- which is the state every build before this
+   * one booted in. 100 M clk_core is 3.5 s, well past a 2 MB restore on a slow
+   * card, and it restarts from zero the moment the restore stops asserting. */
+  localparam [27:0] SF_HOLD_MAX = 28'd100_000_000;
+  reg        [27:0] sf_hold_cnt = 28'd0;
+
+  always @(posedge clk_core) begin
+    if (sf_restore_c2) begin
+      if (sf_hold_cnt != SF_HOLD_MAX)
+        sf_hold_cnt <= sf_hold_cnt + 28'd1;
+    end else
+      sf_hold_cnt <= 28'd0;
+  end
+
+  wire sf_restore_hold = sf_restore_c2 && (sf_hold_cnt != SF_HOLD_MAX);
+
+  /* ... AND A RESTORE THAT DID NOT FINISH MUST NOT BE ABLE TO EAT THE SAVE
+   * (2026-11-09).
+   *
+   * The console is let out at the ceiling above, so the game boots on whatever
+   * image the framework delivered -- that part is deliberate. But if the load
+   * never happened, the image is the cartridge with a stale or absent save, and
+   * the first thing a game does is write its own new save: this core would take
+   * the player's `.sav` and replace it with a fresh-game one, silently. So a
+   * restore that hit the ceiling latches this, and the writer is not triggered
+   * for the rest of the cartridge. A save that was not read is not a save that
+   * may be overwritten. */
+  reg [1:0] cart_new_s = 2'b00;      // cart_new, in clk_core
+
+  always @(posedge clk_core) begin
+    cart_new_s <= {cart_new_s[0], cart_new};
+
+    if (cart_new_s[1])
+      sf_load_lost <= 1'b0;
+    else if (sf_restore_c2 && (sf_hold_cnt == SF_HOLD_MAX))
+      sf_load_lost <= 1'b1;
   end
 
   /* THE MACHINE IS NOT PART OF THE SHUTDOWN (2026-11-03).
@@ -1869,7 +2970,30 @@ module core_top (
    * exactly as every other core's does, which is the case the write exists for. */
   wire external_reset_run = external_reset & reset_n;
 
-  assign machine_reset = ~core_ready_c2 | external_reset_run | dl_wait_c;
+  /* THE STREAM'S SPEED, MEASURED (2026-11-05).
+   *
+   * `fill` in sim/gt/tb_slot.cpp counts the console clock and the stream's
+   * beats inside the core, so the number does not depend on the harness's own
+   * pacing: **24.34 clk_core per 8-byte beat, 9.41 MB/s**. The APF reads a
+   * 4-byte word every ~80 clk_74a (3.7 MB/s), so the stream is 2.5x the host
+   * with the port to itself.
+   *
+   * It does not have the port to itself while the console runs. rtl/mem_bus.sv
+   * gives this client the first turn of every arbitration, but a turn is a
+   * sixteen-beat burst: a CPU fetching code takes turns between the stream's,
+   * which halves the rate to ~4.7 MB/s -- inside 1.3x of the host, and a margin
+   * that thin is what the card's `.sav` was showing (three words in four zero).
+   *
+   * So the machine is PAUSED for the read-out (see `save_stream` above), not
+   * reset and not left running. With the port to itself the window fills to its
+   * 1,920-byte high-water mark, the ack waits for that (rtl/gt_save_slot.sv,
+   * `ACK_WORDS`), and the host then reads a window that is full and stays full.
+   * sim/gt/tb_cart_ss.cpp checks the resulting file against the cartridge
+   * itself: identical, and identical again with the host reading at 2.6x the
+   * APF's pace. */
+  assign machine_reset = ~core_ready_c2 | external_reset_run | dl_wait_c |
+                         nv_load_c2 | sf_restore_hold;   // a RAM32K save, and
+                         // our own file, are still loading
 
   /* ---- THE BISECT SWITCH (2026-10-25) ---------------------------------
    * The panel: a save writes a complete, correct 36,920-byte state -- the .sta
@@ -1904,6 +3028,9 @@ module core_top (
       // Boot cart until a .gtr has been downloaded, rtl/cart.sv after that.
       .cart_addr (cart_addr),
       .cart_data (cart_data),
+      // ... and the read-out, so a flash program waits for the OS's .sav rather
+      // than landing in the middle of it (rtl/cart.sv's `ss_readout`).
+      .ss_readout (save_readout),
       .cart_present (cart_present),
 
       .dl_active (dl_stream),
@@ -1911,14 +3038,30 @@ module core_top (
       .dl_addr   (dl_addr_r),
       .dl_data   (dl_data_r),
       .dl_img_size (cart_decl_size),
+      .ram32k_decl (ram32k_c2),
       .dl_busy   (dl_busy),
       .dl_wait   (dl_wait),
       .cart_size (cart_size),
 
-      // The game's `$90` "save finished" pulse. Nothing here consumes it now
-      // that the core-side writer is gone; the port stays connected because the
-      // machine still produces it and the harnesses instantiate the same module.
-      .save_trig (),
+      .nvram_q     (nvram_q),
+      .nvram_addr  (nvram_addr),
+      .nvram_wr    (nvram_wr),
+      .nvram_wdata (nvram_wdata),
+
+      // The game's own save event: `$90`, or a completed flash program/erase.
+      // It is what rtl/gt_save_file.sv commits the `.sav` on -- every write
+      // restarts its 150 ms settle timer, so a save burst is one file write.
+      // `sf_load_lost` vetoes it for a cartridge whose restore never finished;
+      // see the note above.
+      .save_trig (gt_save_trig),
+
+      .dspan_req (sf_span_req_c[1]),
+      .dspan_ack (sf_span_ack_c),
+      .dspan_lo  (sf_span_lo),
+      .dspan_hi  (sf_span_hi),
+      .dspan_any (sf_span_any),
+      .worm_lo   (worm_lo),
+      .worm_any  (worm_any),
 
       // The save state's black box (see THE BLACK BOX above).
       .ss_diag   (ss_diag),

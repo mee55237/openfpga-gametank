@@ -37,6 +37,19 @@ output  reg             dataslot_requestread,
 output  reg     [15:0]  dataslot_requestread_id,
 input   wire            dataslot_requestread_ack,
 input   wire            dataslot_requestread_ok,
+/* THERE IS NO "NOTHING TO SAVE" ANSWER, AND RESULT 1 IS NOT ONE
+ * (2026-11-09, from the panel). `[0080]` was briefly answered with result 1,
+ * "not allowed ever" (Host/Target Commands: 0 ready, 1 not allowed ever,
+ * 2 check later), for a session that had written nothing since its save was
+ * loaded -- the idea being that the OS would then leave the `.sav` alone and
+ * the quit would cost nothing. It does leave the file alone, and it also
+ * reports `error in framework: slot 2 denied` on the way out: 1 is the
+ * protocol's "this slot can never be read", not "nothing changed". A slot
+ * that answers it is a broken slot to the OS, so this core never does. The
+ * read-out always runs; its cost is the size table's, and that is why a
+ * flash cartridge that saved nothing declares ZERO bytes -- "size of the data
+ * slot. Zero if the slot is not used" -- and a session that did save declares
+ * only the head plus the tail below its lowest written byte. */
 
 output  reg             dataslot_requestwrite,
 output  reg     [15:0]  dataslot_requestwrite_id,
@@ -194,7 +207,14 @@ localparam  [3:0]   ST_DONE_ERR     = 'd15;
  * answer always wins and the timeout only fires for an answer that was never
  * coming. On expiry the command is answered as if it had succeeded: a shutdown
  * that reads out a stale window still writes a file, and a file beats a hang. */
-localparam  [22:0]  HOST_WD_MAX     = 23'h3F_FFFF;
+/* LONG ENOUGH FOR A REAL `[0080]` (`1 in 4 words`, 2026-11-06). The save
+ * slot answers `[0080]` only once a whole 8 KB window of the image is
+ * resident (rtl/gt_save_slot.sv), which is ~1.3 ms in sim and several times
+ * that on the part, because the model there has no wait states. The old
+ * 56 ms bound is close enough to that to turn a slow fill into a command
+ * error, and a command error is what the OS acts on. 113 ms is still a
+ * watchdog: nothing this core does legitimately takes longer. */
+localparam  [22:0]  HOST_WD_MAX     = 23'h7F_FFFF;
     reg     [22:0]  hstate_wd;
 
 // target
@@ -545,7 +565,19 @@ always @(posedge clk) begin
             dataslot_allcomplete <= 0;
             dataslot_requestread <= 1;
             dataslot_requestread_id <= host_20[15:0];
-            if(dataslot_requestread_ack) begin
+            // THE REQUEST MUST BE VISIBLE BEFORE ITS ACK IS BELIEVED
+            // (2026-11-05). `dataslot_requestread` is registered, so on
+            // the first cycle in this state it is still 0 -- and the ack
+            // is a wire that is `save_req_read ? ps_ack : 1'b1` in
+            // rtl/core_top.v, i.e. it collapses to 1 exactly while the
+            // request is invisible. Sampled alone, it answered `[0080]`
+            // on entry and the OS started reading a window the save slot
+            // had not armed yet: the first words of the .sav came back
+            // zero (sim/gt/tb_core_ss.cpp's `probe_reqread` check).
+            // Waiting for the request to be one cycle old is what makes
+            // the slot's own "word 0 is resident" ack the thing the OS
+            // waits on.
+            if(dataslot_requestread && dataslot_requestread_ack) begin
                 host_resultcode <= 0;
                 if(!dataslot_requestread_ok) host_resultcode <= 2;
                 hstate <= ST_DONE_CODE;
@@ -702,10 +734,15 @@ always @(posedge clk) begin
      * command that has no failure mode worth timing out: if the framework never
      * answers, it is not going to run the core either way.
      *
-     * So the counter now runs only in the two data-slot states (see
-     * TARG_WD_MAX), and RTR waits exactly as the template's does. */
-    if(tstate == TARG_ST_DATASLOTOP || tstate == TARG_ST_WAITRESULT_DSO ||
-       tstate == TARG_ST_WAITRESULT_RTR) begin
+     * So the counter runs ONLY in the two data-slot states (see TARG_WD_MAX),
+     * and RTR waits exactly as the template's does. That last clause was a lie
+     * in the code for a week: this condition still listed
+     * `TARG_ST_WAITRESULT_RTR`, so a launch slow enough to cross 0.90 s had its
+     * marker withdrawn and re-offered while the framework was deciding whether
+     * the core was ready -- the same panel message, from the same file, one
+     * state over. RTR is out of the count now, and the state has no exit but
+     * the host's `ok` (see TARG_ST_WAITRESULT_RTR). */
+    if(tstate == TARG_ST_DATASLOTOP || tstate == TARG_ST_WAITRESULT_DSO) begin
         if(targ_wd != TARG_WD_MAX) targ_wd <= targ_wd + 1;
     end else
         targ_wd <= 0;
@@ -891,30 +928,32 @@ always @(posedge clk) begin
         end
     end
     TARG_ST_WAITRESULT_RTR: begin
-        /* THE MARKER IS RE-OFFERED, NOT WAITED ON FOREVER (2026-11-02).
+        /* THE MARKER IS NOT RE-OFFERED (2026-11-09).
          *
-         * This state used to have no exit but the host's `ok`, and its note
-         * said the marker "stays up until the framework answers it, however
-         * long the launch takes". That holds only if the framework is going to
-         * answer -- and this marker is raised a few milliseconds after
-         * configuration, while the OS is still streaming the cartridge, so
-         * whether it is seen depends on when the OS next looks at its target
-         * register. When it is not seen, the target channel parks here for the
-         * session: no `[0184` is ever issued (the `.sav` stays empty), and the
-         * reset clear releases whatever was queued into a host that is closing
-         * (the quit that goes black).
+         * This state once had a watchdog that WITHDREW `cm 0140` and put it
+         * back in the queue. The note above it already called that a mistake:
+         * withdrawing the marker is the one thing that produces "error in
+         * framework: core not ready to run", and the template's own RTR state
+         * has no timeout at all.
          *
-         * On expiry the marker is WITHDRAWN and put back in the queue, so idle
-         * re-offers it -- after any command the save writer is waiting on. The
-         * framework is never left holding a `cm` this core has stopped tracking,
-         * and the marker keeps being offered until it is taken. */
-        if(target_0[31:16] == 16'h6F6B) begin
+         * It stayed in the code because every later fix was measured against a
+         * launch that fails for other reasons. What it does on a slow launch is
+         * clean, and fatal: the marker is raised a few milliseconds after
+         * configuration, while the OS is still streaming the cartridge and the
+         * save -- 2 MB of slot data is well over 0.90 s -- and at 0.90 s this
+         * branch zeroes `target_0`. The framework then looks at its target
+         * register and sees no ready-to-run, whatever it was about to answer.
+         * The marker is re-offered from idle, so it is absent for as little as
+         * two clocks, but the framework's poll is not synchronised to this
+         * clock, and a data-slot command queued behind it keeps it absent for
+         * the length of that command. A race with a 2-clock window, run once
+         * per launch, is a panel that fails some launches and not others.
+         *
+         * So there is no timeout here, exactly as in the template: the marker
+         * stands until the host answers it, however long the launch takes. If
+         * the framework never answers, it was never going to run the core. */
+        if(target_0[31:16] == 16'h6F6B)
             tstate <= TARG_ST_IDLE;
-        end else if(targ_wd == TARG_WD_MAX) begin
-            target_0                <= 32'h0;
-            status_setup_done_queue <= 1;
-            tstate                  <= TARG_ST_IDLE;
-        end
     end
     endcase
 

@@ -38,6 +38,11 @@ module gametank
     output logic [14:0] cart_addr,
     input  logic [7:0]  cart_data,
 
+    // The OS is streaming this image out (rtl/gt_save_slot.sv), in clk_74a. It
+    // is not a reset and not a pause: rtl/cart.sv only uses it to make a flash
+    // program wait, so the .sav the OS is reading cannot change under it.
+    input  logic        ss_readout,
+
     // .gtr download stream into the PSRAM cartridge (loader / sim harness)
     input  logic        dl_active,
     input  logic        dl_wr,
@@ -47,9 +52,24 @@ module gametank
     // rtl/cart.sv takes the cart's type and size from this, never from what
     // the port received -- a .sav restore writes through the same port.
     input  logic [21:0] dl_img_size,
+    // RAM32K signature, decided on the bridge side before the Save slot loads
+    // (see rtl/core_top.v); rtl/cart.sv latches it at the end of the download.
+    input  logic        ram32k_decl,
     output logic        dl_busy,
     output logic        dl_wait,   // keep the console in reset (fill running)
     output logic [21:0] cart_size, // bytes in the image (APF save slot size)
+
+    /* ---- RAM32K save RAM (Flash2M_RAM32K carts) ------------------------
+     *
+     * The 32 KB array itself lives in rtl/core_top.v, in the Pocket's
+     * clk_74a domain, because it is also the Save slot's storage on a RAM32K
+     * cart. The machine only supplies the 6502 side: the bank-selected byte
+     * address, the read byte, and the write pulse/data. Nothing here knows
+     * what a data slot is. */
+    input  logic [7:0]  nvram_q,
+    output logic [14:0] nvram_addr,
+    output logic        nvram_wr,
+    output logic [7:0]  nvram_wdata,
 
     // flash-save persistence (hps_io SD block interface / sim harness)
     output logic [31:0] sd_lba,
@@ -162,7 +182,25 @@ module gametank
      * and writes the image out to the card itself, because the OS's
      * nonvolatile writeback does not work on this core (see that file).
      */
-    output logic        save_trig
+    output logic        save_trig,
+
+    /* ---- what the game rewrote, for the Pocket-side file writer ----------
+     *
+     * rtl/cart.sv holds the lowest and highest image byte programmed or erased
+     * since the last capture; rtl/gt_save_file.sv asks for it (a handshake, in
+     * its own clock) and writes only that span to the card instead of the whole
+     * cartridge. See the ports in rtl/cart.sv. */
+    input  logic        dspan_req,
+    output logic        dspan_ack,
+    output logic [20:0] dspan_lo,
+    output logic [20:0] dspan_hi,
+    output logic        dspan_any,
+
+    /* The lowest image byte rewritten SINCE THE IMAGE WAS LOADED, which is what
+     * sizes the .sav (rtl/core_top.v's `sv_lo`). Different question from the
+     * span above, which is "since the last save"; see rtl/cart.sv's ports. */
+    output logic [20:0] worm_lo,
+    output logic        worm_any
 );
 
 // Audio coprocessor: unsigned 8-bit DAC level on both channels (AUDIO_S=0
@@ -667,6 +705,7 @@ cart cart
     .reset          (reset),
 
     .cart_addr      (cart_addr),
+    .ss_readout     (ss_readout),
     .cart_rd        (cart_rd),
     .cart_wr        (cart_wr),
     .cart_wdata     (cart_wdata),
@@ -689,6 +728,15 @@ cart cart
     .save_trigger   (save_trigger),
     .flash_done     (flash_done),
 
+    .dspan_req      (dspan_req),
+    .dspan_ack      (dspan_ack),
+    .dspan_lo       (dspan_lo),
+    .dspan_hi       (dspan_hi),
+    .dspan_any      (dspan_any),
+
+    .worm_lo        (worm_lo),
+    .worm_any       (worm_any),
+
     // ioctl downloads and savectl's restore stream share the port (they
     // are serialized: savectl only runs while no download is active)
     .dl_active      (dl_active || sv_active),
@@ -696,9 +744,15 @@ cart cart
     .dl_addr        (sv_active ? sv_addr : dl_addr),
     .dl_data        (sv_active ? sv_data : dl_data),
     .dl_img_size    (dl_img_size),
+    .ram32k_decl    (ram32k_decl),
     .dl_busy        (dl_busy),
     .dl_wait        (dl_wait),
     .cart_size      (cart_size),
+
+    .nvram_q        (nvram_q),
+    .nvram_addr     (nvram_addr),
+    .nvram_wr       (nvram_wr),
+    .nvram_wdata    (nvram_wdata),
 
     .mem_rd         (k_rd),
     .mem_we         (k_we),

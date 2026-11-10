@@ -338,13 +338,22 @@ set_global_assignment -name FITTER_EFFORT "STANDARD FIT"
 set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION ON
 
 # Enables Physical Synthesis to push performance limits
-set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT FAST
-#was EXTRA
+#
+# THESE FOUR WERE TURNED DOWN TO MAKE THE BUILD FASTER, AND THAT IS THE TIMING
+# (2026-11-09). `PHYSICAL_SYNTHESIS_EFFORT` was FAST ("#was EXTRA"), and both
+# multipliers were 1 ("# BOTTEM 2 WERE 4.0"). Over the same window clk_74a's
+# setup slack went from +4.18 ns on a clean build, to -0.280 ns on 2026-11-02,
+# to -5.178 ns / TNS -530.6 on the 2026-11-09 13:10 fit -- while the design sat
+# at 38% of the ALMs, i.e. it is not out of room, it is being asked to stop
+# optimising. Back to the values the notes record for the build that closed
+# timing: EXTRA, 4, 4. A fit will take longer; that is the trade, and a
+# bitstream whose only negative setup path is the host clock is not one to
+# ship.
+set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT EXTRA
 set_global_assignment -name ADVANCED_PHYSICAL_SYNTHESIS ON
 set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
-set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1
-set_global_assignment -name ROUTER_EFFORT_MULTIPLIER 1
-# BOTTEM 2 WERE 4.0
+set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 4
+set_global_assignment -name ROUTER_EFFORT_MULTIPLIER 4
 
 # Assembler Assignments
 # =====================
@@ -825,6 +834,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE gametank.sv
 set_global_assignment -name SYSTEMVERILOG_FILE gt_video.sv
 set_global_assignment -name SYSTEMVERILOG_FILE gt_savestates.sv
 set_global_assignment -name SYSTEMVERILOG_FILE gt_save_slot.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_save_file.sv
+set_global_assignment -name SYSTEMVERILOG_FILE gt_nvram.sv
 # The core's own .sav writer (target commands 0184/0188/0190/0192).
 set_global_assignment -name SYSTEMVERILOG_FILE save_state_controller.sv
 set_global_assignment -name SYSTEMVERILOG_FILE gt_state_buffer.sv
@@ -911,4 +922,11 @@ set_global_assignment -name EDA_SIMULATION_TOOL "<None>"
 set_global_assignment -name TIMEQUEST_MULTICORNER_ANALYSIS OFF
 set_global_assignment -name OPTIMIZATION_MODE "BALANCED"
 set_global_assignment -name OPTIMIZE_IOC_REGISTER_PLACEMENT_FOR_TIMING OFF
-set_global_assignment -name TIMEQUEST_DO_REPORT_TIMING OFF
+# DETAILED PATHS, NOT JUST THE SUMMARY (2026-11-09).
+#
+# `ap_core.sta.rpt` used to hold the four-line clock table and nothing else, so
+# a failing `clk_74a` was a number with no cone behind it: "-5.178 ns" and no
+# way to say which path. With this on, the fit writes the worst setup paths
+# (from node, to node, per-stage delay) into the report, and a residual miss
+# can be fixed at the logic that causes it instead of by guessing.
+set_global_assignment -name TIMEQUEST_DO_REPORT_TIMING ON

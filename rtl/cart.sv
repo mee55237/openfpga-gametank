@@ -60,6 +60,21 @@ module cart
     output logic [7:0]  cart_data,      // valid by the next strobe
     output logic        cart_stall,     // freeze cpu_ce while a miss is out
     output logic        cart_present,
+
+    /* A FLASH PROGRAM WAITS UNTIL THE OS HAS FINISHED READING (2026-11-07).
+     *
+     * The mapper's flash emulation writes THIS image, in PSRAM, and the Save
+     * slot streams the same image out to the OS. Both at once is a .sav of a
+     * cartridge that never existed -- half old bytes, half new.
+     *
+     * That could not happen while the console was held for the whole read-out.
+     * It is not held for the whole of it any more (rtl/gt_save_slot.sv's
+     * `hold_console`: the CPU runs whenever the window does not need the port),
+     * so this is the gate that makes the new hold safe: a latched write is not
+     * taken while the OS is reading, and `cart_stall` already holds the CPU
+     * from the moment it is latched. So a game that programs flash during a
+     * flush waits for the flush, and a game that does not is untouched. */
+    input  logic        ss_readout,     // clk_74a: the OS is reading the image
     output logic        save_trigger,   // 1-clk pulse: game wrote flash $90
     /* A COMPLETED PROGRAM OR ERASE IS THE REAL SAVE EVENT (2026-11-02).
      *
@@ -71,6 +86,47 @@ module cart
      * emulator's own definition of "the cartridge changed": program is a
      * one-shot AND after $A0, erase is the chip's sector table. */
     output logic        flash_done,      // 1-clk pulse: a program/erase finished
+
+    /* ---- the span of the image the game has changed (2026-11-08) ---------
+     *
+     * rtl/gt_save_file.sv writes the image to the card, and writing all of it
+     * for a game that changed three sectors is what made a save take as long as
+     * a quit. These four ports are the alternative: the lowest and highest image
+     * byte any program or erase has touched since the last capture.
+     *
+     * The capture is a two-phase handshake in the two clocks it spans (this one
+     * is the machine's, the writer's is clk_74a): the writer raises `dspan_req`
+     * and holds it, the snapshot is taken and the span cleared on the first
+     * clock this side sees it, and `dspan_ack` follows. The lo/hi/any values are
+     * static from `dspan_ack` until the next request, so the writer samples them
+     * once and nothing can tear.
+     *
+     * A flash erase is a whole sector -- up to 64 KB -- so a save that erases
+     * and rewrites one sector costs one sector, and a chip erase costs the image
+     * (which is right: the game really did rewrite all of it). */
+    input  logic        dspan_req,
+    output logic        dspan_ack,
+    output logic [20:0] dspan_lo,
+    output logic [20:0] dspan_hi,
+    output logic        dspan_any,
+
+    /* THE LOWEST IMAGE BYTE REWRITTEN SINCE THE IMAGE WAS LOADED (2026-11-09).
+     *
+     * `dspan_*` above is a snapshot the writer captures and clears: it answers
+     * "what has changed since the last save". This answers a different
+     * question -- "what has changed since the cartridge was loaded" -- because
+     * that is what the .sav on the card has to describe. The image on this card
+     * is always the pristine .gtr plus everything the game has written since
+     * boot, so a save file only needs the image from its lowest changed byte
+     * to the end; everything below it is still the .gtr's own bytes and is put
+     * back by loading the cartridge. It only ever falls, and a new image
+     * resets it to the top.
+     *
+     * 0x1F_FFFF is "nothing changed", so a session with no save produces no
+     * range at all and the writer keeps its old behaviour.
+     */
+    output logic [20:0] worm_lo,
+    output logic        worm_any,
 
     // Emulator-compatible VIA Port A register levels (bank shift register;
     // DDRA is intentionally ignored by the core top, as in the emulator)
@@ -110,8 +166,9 @@ module cart
      *
      * WHY THIS IS AN INPUT AND NOT A MEASUREMENT. This port carries THREE
      * streams: the .gtr (slot 1, the cartridge asset), the .sav (slot 2, the
-     * save -- which on this console IS a cartridge image), and the MiSTer
-     * flash-save restore. The image's size used to be the maximum byte offset
+     * save -- a cartridge image on a flash cart, the 32 KB SRAM on a RAM32K
+     * one), and the MiSTer flash-save restore. The image's size used to be the
+     * maximum byte offset
      * any of them wrote, and that is wrong in a way that feeds itself: load a
      * 2 MB .sav into a 32 KB EEPROM cart and the measured size becomes 2 MB,
      * so `ctype` is inferred as Flash2M (the game is mapped as a 2 MB flash
@@ -122,11 +179,37 @@ module cart
      * else's -- and the APF knows it before a byte moves. */
     input  logic [21:0] dl_img_size,
 
+    /* RAM32K IS DECIDED BEFORE THE SAVE ARRIVES (2026-11-04).
+     *
+     * The signature lives in the last sixteen bytes of a 2 MB image
+     * ($1FFFF0), so rtl/core_top.v captures it on the bridge's slot-1 writes
+     * and has the answer before the OS starts loading the Save slot. This
+     * module only latches it at the end of the download: the machine is held
+     * in reset for the whole transfer, so no 6502 instruction can run between
+     * the two, and the bank latch's RAM32K select is correct on the first
+     * cycle the console is released. */
+    input  logic        ram32k_decl,
+
     // Size of the image: the cartridge slot's declared size when there is one,
-    // otherwise what the download port actually received. The APF end uses it
-    // to size the save slot (a .sav is the cartridge image) and to report the
-    // cart's identity to the OS.
+    // otherwise what the download port actually received. It is the cart's
+    // identity to the OS, and the Save slot's size on a flash or EEPROM cart
+    // (on a RAM32K cart that slot is the 32 KB SRAM instead; rtl/core_top.v
+    // sizes it).
     output logic [21:0] cart_size,
+
+    /* ---- RAM32K save RAM (Flash2M_RAM32K carts) -------------------------
+     *
+     * The storage is rtl/gt_nvram.sv, because the same 32 KB is the Pocket's
+     * Save slot on a RAM32K cart (clk_74a) and the 6502's two 16 KB banks
+     * (clk_core). This module only decides when the CPU sees it:
+     * `nvram_addr` is the bank-6-selected offset, `nvram_q` is the byte, and
+     * `nvram_wr` is the one-clock write pulse. The read side is continuous
+     * (gt_nvram keeps its output registered at `nvram_addr`), so a read only
+     * has to select `nvram_q` for the rest of the bus window. */
+    input  logic [7:0]  nvram_q,
+    output logic [14:0] nvram_addr,
+    output logic        nvram_wr,
+    output logic [7:0]  nvram_wdata,
 
     // PSRAM client (via ddr_mux)
     output logic        mem_rd,
@@ -156,10 +239,23 @@ logic [7:0] bank_shift;
 logic [7:0] bank_mask /*verilator public_flat_rd*/;
 
 // only PA0 (clock), PA1 (data), PA2 (latch) matter; bank_mask[7] is the
-// RAM32K save-RAM select, forced high in M7 (no RAM32K support)
-wire _unused = &{1'b0, pa_q[7:3], bank_mask[7], fill_off[2:0], er_end[2:0]};
+// RAM32K save-RAM select on that cart type, and forced high on every other
+// cart (nothing else has save RAM, and the emulator forces the same bit).
+wire _unused = &{1'b0, pa_q[7:3], fill_off[2:0], er_end[2:0]};
 
 assign ss_bank_q = bank_mask;
+
+/* RAM32K IS A CARTRIDGE IDENTITY, NOT A SETTING (2026-11-04).
+ *
+ * A 2 MB cart is Flash2M, and some of those also carry a 32 KB
+ * battery-backed SRAM. The file itself says which: the last sixteen bytes of
+ * the image start with the ASCII string "SAVE" at $1FFFF0 (the emulator's own
+ * test, gte.cpp: LoadRomFile). rtl/core_top.v captures it on the bridge writes
+ * -- the only moment the bytes are guaranteed to be the cartridge the user
+ * picked -- and this module latches the answer at the end of the download. */
+// Latched from ram32k_decl at the end of a download; cleared while one is in
+// flight so the bank latch resets to the flash identity.
+logic       ram32k = 1'b0;
 
 always_ff @(posedge clk_sys) begin
     pa_q <= via_pa;
@@ -167,23 +263,30 @@ always_ff @(posedge clk_sys) begin
         // undefined on real hardware; the emulator's BSS-zero init makes
         // games see BANK 0 before the first SPI latch — match it (the
         // emulator is the compatibility floor; games may read banked data
-        // before programming the register)
-        bank_shift <= 8'h80;
-        bank_mask  <= 8'h80;
+        // before programming the register). On a RAM32K cart bank_mask[7] is
+        // the SRAM select, so its zero state is the SRAM, exactly as in the
+        // emulator; every other cart forces the bit high (bank 0 of flash).
+        //
+        // The type arrives at dl_end, but dl_wait holds the machine in reset
+        // through the fixed-bank fill that follows it, so this branch runs
+        // again with `ram32k` already latched: the console is released with
+        // the SRAM selected on a RAM32K cart, and flash bank 0 on any other.
+        bank_shift <= ram32k ? 8'h00 : 8'h80;
+        bank_mask  <= ram32k ? 8'h00 : 8'h80;
     end
     /* A STATE LOAD WINS OVER A SHIFT PULSE (it is a register write, and the
-     * CPU that would clock the shifter is held for it). Bit 7 is the RAM32K
-     * select, which M7 forces high: nothing this console runs has 32 KB of save
-     * RAM in the cart, so the top bit is not the game's to set. */
+     * CPU that would clock the shifter is held for it). The top bit is the
+     * RAM32K select: it belongs to the game on that cart type and is forced
+     * high everywhere else. */
     else if (ss_bank_we) begin
-        bank_mask  <= ss_bank | 8'h80;
-        bank_shift <= ss_bank | 8'h80;
+        bank_mask  <= ss_bank | (ram32k ? 8'h00 : 8'h80);
+        bank_shift <= ss_bank | (ram32k ? 8'h00 : 8'h80);
     end
     else begin
         if (via_pa[0] && !pa_q[0])          // shift clock rising edge
             bank_shift <= {bank_shift[6:0], pa_q[1]};   // pre-edge data
         if (via_pa[2] && !pa_q[2])          // latch (CS) rising edge
-            bank_mask <= bank_shift | 8'h80;  // [7] forced: no RAM32K in M7
+            bank_mask <= bank_shift | (ram32k ? 8'h00 : 8'h80);
     end
 end
 
@@ -311,7 +414,15 @@ assign dl_wait = dl_active_q || dlw_pend || (dlb_mask != 8'h00) || filling;
 wire [20:0] rd_off  = img_off(ctype, bank_mask[6:0], eep_mask, cart_addr[13:0]);
 wire [18:0] rd_word = {1'b0, rd_off[20:3]};
 
+/* The save-RAM window: $8000-$BFFF with bank_mask[7] clear, on a RAM32K cart
+ * only. $C000+ is never SRAM (the fixed flash bank stays mapped), which is
+ * the emulator's `address & 0x4000` test. */
+wire         nv_sel = ram32k && !bank_mask[7] && !cart_addr[14];
+assign       nvram_addr  = {bank_mask[6], cart_addr[13:0]};
+assign       nvram_wdata = cart_wdata;
+
 logic        serve_fixed;              // last read was $C000+
+logic        serve_nv;                 // last read was the RAM32K save RAM
 logic [2:0]  serve_lane;
 logic [7:0]  bank_q;
 
@@ -338,9 +449,25 @@ always_ff @(posedge clk_sys) begin
 end
 
 
-// a new flash write while the previous op is still running stalls the CPU
-assign cart_stall = miss_pend || (fw_pend && (fw_busy || st != IDLE));
-assign cart_data  = serve_fixed ? fixed_qw[fx_lane*8 +: 8] : bank_q;
+// The read-out end of the gate above. A level, so two flops is all the
+// synchroniser it needs.
+logic [1:0] ss_readout_s = 2'b0;
+
+always_ff @(posedge clk_sys)
+    ss_readout_s <= {ss_readout_s[0], ss_readout};
+
+wire image_busy = ss_readout_s[1];
+
+// a new flash write while the previous op is still running stalls the CPU --
+// and so does one held off for the OS's read-out. `image_busy` belongs in here:
+// a write the FSM has not taken yet is still latched in `fw_pend`, and a second
+// strobe would overwrite it, so a three-write unlock sequence that was gated
+// mid-way would collapse into its last byte. Stalling from the moment it is
+// latched is what makes the gate lossless.
+assign cart_stall = miss_pend || (fw_pend && (fw_busy || st != IDLE || image_busy));
+assign cart_data  = serve_nv    ? nvram_q
+                  : serve_fixed ? fixed_qw[fx_lane*8 +: 8]
+                  :               bank_q;
 
 // ---------------------------------------------------------------------------
 // Flash-write emulation (FLASH2M carts, emulator-faithful — gte.cpp
@@ -374,6 +501,115 @@ wire [20:0] fw_img = fw_addr[14] ? {7'h7F, fw_addr[13:0]}
                                            fw_addr[13:0]);
 // sector decode per the emulator: {bank[6:0], addr13}
 wire [7:0] sec_bits = {bank_mask[6:0], fw_addr[13]};
+
+// ---------------------------------------------------------------------------
+// Which bytes a program or an erase changes (2026-11-08) -- see the ports.
+// The erase's range comes from the chip's sector table, in ONE place: the same
+// `er_lo_n`/`er_hi_n` drive `fw_off`/`er_end` below, so the span and the erase
+// can never disagree about which bytes were rewritten.
+// ---------------------------------------------------------------------------
+logic [20:0] er_lo_n, er_hi_n;
+
+always_comb begin
+    if (fw_data == 8'h10) begin              // chip erase
+        er_lo_n = 21'h000000;
+        er_hi_n = 21'h1FFFFF;
+    end
+    else if (sec_bits[7:3] < 5'd31) begin    // 64 KB banks 0..30
+        er_lo_n = {sec_bits[7:3], 16'h0000};
+        er_hi_n = {sec_bits[7:3], 16'hFFFF};
+    end
+    else if (!sec_bits[2]) begin             // $F8 $1F0000-$1F7FFF
+        er_lo_n = 21'h1F0000;
+        er_hi_n = 21'h1F7FFF;
+    end
+    else if (sec_bits == 8'hFC) begin        // $FC 8 KB
+        er_lo_n = 21'h1F8000;
+        er_hi_n = 21'h1F9FFF;
+    end
+    else if (sec_bits == 8'hFD) begin        // $FD 8 KB
+        er_lo_n = 21'h1FA000;
+        er_hi_n = 21'h1FBFFF;
+    end
+    else begin                               // $FE/$FF: fixed 16 KB
+        er_lo_n = 21'h1FC000;
+        er_hi_n = 21'h1FDFFF;
+    end
+end
+
+logic [20:0] sp_lo  = 21'h1F_FFFF;   // lowest byte changed since the capture
+logic [20:0] sp_hi  = 21'h00_0000;   // highest byte changed (inclusive)
+logic        sp_any = 1'b0;
+logic        sp_ack = 1'b0;
+logic [20:0] sp_lo_q = 21'h0, sp_hi_q = 21'h0;
+logic        sp_any_q = 1'b0;
+
+// The write the PSRAM machine is about to take at the top of this clock.
+wire chg_take = (st == IDLE) && fw_pend && !fw_busy && !image_busy;
+wire chg_prog = chg_take && flash_wrmode;                       // one byte
+wire chg_era  = chg_take && !flash_wrmode &&
+                (fw_data == 8'h30 || fw_data == 8'h10);         // a sector/chip
+wire chg_any  = chg_prog || chg_era;
+wire [20:0] chg_lo = chg_prog ? fw_img : er_lo_n;
+wire [20:0] chg_hi = chg_prog ? fw_img : er_hi_n;
+
+assign dspan_lo  = sp_lo_q;
+assign dspan_hi  = sp_hi_q;
+assign dspan_any = sp_any_q;
+assign dspan_ack = sp_ack;
+
+/* ... and the low-water mark the save file is sized from. It follows every
+ * program and erase, whether or not a save was taken in between, and only a new
+ * image puts it back to "nothing changed". */
+always_ff @(posedge clk_sys) begin
+    /* ONLY A NEW IMAGE CLEARS IT, NOT A RESET (2026-11-09).
+     *
+     * `reset` here is the machine's, and Pocket's shutdown asserts it FIRST:
+     * `[0010 Reset Enter]`, then `[0080 Data slot request read]`. Clearing the
+     * "has anything been written" bit on that reset made every real quit look
+     * like a session that saved nothing, so the save file was sized as the
+     * untouched cartridge and the write the game had made was never in it. The
+     * bit starts cleared, and a fresh image is a `dl_start`, so the reset was
+     * never the thing that put this back to "nothing changed" anyway. */
+    if (dl_start) begin
+        worm_lo  <= 21'h1F_FFFF;
+        worm_any <= 1'b0;
+    end else if (chg_any) begin
+        worm_lo  <= (chg_lo < worm_lo) ? chg_lo : worm_lo;
+        worm_any <= 1'b1;
+    end
+end
+
+always_ff @(posedge clk_sys) begin
+    if (reset || dl_start) begin
+        // A new image is not the image the last span described.
+        sp_lo    <= 21'h1F_FFFF;
+        sp_hi    <= 21'h00_0000;
+        sp_any   <= 1'b0;
+        sp_ack   <= 1'b0;
+        sp_lo_q  <= 21'h0;
+        sp_hi_q  <= 21'h0;
+        sp_any_q <= 1'b0;
+    end
+    else if (dspan_req != sp_ack) begin
+        // Capture. A change decoded on this very clock is deliberately left in
+        // the NEW span: the writer is about to read the image, and a byte the
+        // PSRAM machine has not written yet cannot be read from it. Its own
+        // `flash_done` asks for another save, and that one writes it.
+        sp_lo_q  <= sp_lo;
+        sp_hi_q  <= sp_hi;
+        sp_any_q <= sp_any;
+        sp_lo    <= chg_any ? chg_lo : 21'h1F_FFFF;
+        sp_hi    <= chg_any ? chg_hi : 21'h00_0000;
+        sp_any   <= chg_any;
+        sp_ack   <= dspan_req;
+    end
+    else if (chg_any) begin
+        sp_lo <= (chg_lo < sp_lo) ? chg_lo : sp_lo;
+        sp_hi <= (chg_hi > sp_hi) ? chg_hi : sp_hi;
+        sp_any <= 1'b1;
+    end
+end
 
 // ---------------------------------------------------------------------------
 // PSRAM machine: download writes, fixed-bank fill (16-word bursts), demand
@@ -432,16 +668,26 @@ always_ff @(posedge clk_sys) begin
     fixed_qw <= fixedram[fx_word];
 
     save_trigger <= 1'b0;
+    nvram_wr     <= 1'b0;
 
     // ---- flash write intake (reset-sensitive) ----------------------------
     if (reset) begin
         flash_wrmode <= 1'b0;
         fw_pend      <= 1'b0;
     end
-    else if (cart_wr && present_r && ctype == T_FLASH2M && !fw_pend) begin
-        fw_pend <= 1'b1;
-        fw_addr <= cart_addr;
-        fw_data <= cart_wdata;
+    /* ON A RAM32K CART, THE BANKED WRITE IS THE SAVE RAM, NOT A FLASH
+     * COMMAND (2026-11-04). The emulator's MemoryWrite checks RAM32K first and
+     * only runs its flash model for FLASH2M; a write here is one byte of SRAM
+     * at the bank-6-selected offset, including the $A0/$30/$90 bytes that would
+     * be commands on a flash-only cart. */
+    else if (cart_wr && present_r) begin
+        if (nv_sel)
+            nvram_wr <= 1'b1;
+        else if (ctype == T_FLASH2M && !ram32k && !fw_pend) begin
+            fw_pend <= 1'b1;
+            fw_addr <= cart_addr;
+            fw_data <= cart_wdata;
+        end
     end
 
     // ---- console-side request latching (reset-sensitive) -----------------
@@ -449,13 +695,19 @@ always_ff @(posedge clk_sys) begin
         req_pend    <= 1'b0;
         miss_pend   <= 1'b0;
         serve_fixed <= 1'b1;
+        serve_nv    <= 1'b0;
     end
     // no download yet → the window is served by the external boot cart;
     // stay silent (no stalls, no DDR traffic)
     else begin
         if (cart_rd && present_r) begin
+            serve_nv    <= nv_sel;
             serve_fixed <= cart_addr[14];
-            if (cart_addr[14]) begin
+            if (nv_sel) begin
+                // gt_nvram is already reading at nvram_addr; the mux above
+                // needs only to select its byte for this bus window.
+            end
+            else if (cart_addr[14]) begin
                 fx_word <= cart_addr[13:3];
                 fx_lane <= cart_addr[2:0];
             end
@@ -484,6 +736,7 @@ always_ff @(posedge clk_sys) begin
     if (dl_start) begin
         dl_size   <= '0;
         present_r <= 1'b0;
+        ram32k    <= 1'b0;              // a new image may be a different cart
         sweep_run <= 1'b1;              // new image: all cache lines stale
         sweep_idx <= '0;
     end
@@ -550,6 +803,9 @@ always_ff @(posedge clk_sys) begin
         // 2 MB save for a 32 KB EEPROM game must not turn it into a flash
         // cart. See `dl_img_size`.
         ctype    <= (img_size <= 22'h08000) ? T_EEPROM : T_FLASH2M;
+        // The signature was captured on the bridge side at $1FFFF0, before
+        // the Save slot began loading; a new cartridge cleared it at offset 0.
+        ram32k   <= ram32k_decl;
         // smallest power-of-two mirror covering the image (min 4 KB)
         eep_mask <= (img_size <= 22'h01000) ? 15'h0FFF :
                     (img_size <= 22'h02000) ? 15'h1FFF :
@@ -561,7 +817,7 @@ always_ff @(posedge clk_sys) begin
     // ---- PSRAM machine ------------------------------------------------------
     unique case (st)
         IDLE: begin
-            if (fw_pend && !fw_busy) begin
+            if (fw_pend && !fw_busy && !image_busy) begin
                 // decode one latched flash write (emulator semantics)
                 fw_pend <= 1'b0;
                 if (flash_wrmode) begin
@@ -580,26 +836,8 @@ always_ff @(posedge clk_sys) begin
                 else if (fw_data == 8'h30 || fw_data == 8'h10) begin
                     fw_busy   <= 1'b1;
                     fw_isprog <= 1'b0;
-                    if (fw_data == 8'h10) begin     // chip erase
-                        fw_off <= 21'h000000;
-                        er_end <= 21'h1FFFFF;
-                    end
-                    else if (sec_bits[7:3] < 5'd31) begin
-                        fw_off <= {sec_bits[7:3], 16'h0000};
-                        er_end <= {sec_bits[7:3], 16'hFFFF};
-                    end
-                    else if (!sec_bits[2]) begin
-                        fw_off <= 21'h1F0000; er_end <= 21'h1F7FFF;
-                    end
-                    else if (sec_bits == 8'hFC) begin
-                        fw_off <= 21'h1F8000; er_end <= 21'h1F9FFF;
-                    end
-                    else if (sec_bits == 8'hFD) begin
-                        fw_off <= 21'h1FA000; er_end <= 21'h1FBFFF;
-                    end
-                    else begin                      // FE/FF: fixed 16 KB
-                        fw_off <= 21'h1FC000; er_end <= 21'h1FDFFF;
-                    end
+                    fw_off <= er_lo_n;              // the table above, one source
+                    er_end <= er_hi_n;
                 end
                 // $90 arms the persist streamer (savectl); the emulator
                 // writes its save file on the same command. Unlock bytes

@@ -83,20 +83,73 @@ endfunction
 // ---------------------------------------------------------------------------
 // Param snoop (the prefetcher's own copies)
 // ---------------------------------------------------------------------------
-logic [7:0] pGY, pH;
+logic [7:0] pGY, pH, pGX, pW;
 logic       trig_pulse;
 
 always_ff @(posedge clk_sys) begin
     trig_pulse <= 1'b0;
     if (param_we) begin
         case (param_addr)
+            3'd2: pGX <= param_data;   // 0/1 are VX/VY, the destination
             3'd3: pGY <= param_data;
+            3'd4: pW  <= param_data;
             3'd5: pH  <= param_data;
             3'd6: if (param_data[0]) trig_pulse <= 1'b1;
             default: ;
         endcase
     end
 end
+
+// ---------------------------------------------------------------------------
+// HOW MUCH OF A ROW A FILL ACTUALLY HAS TO FETCH (2026-11-04).
+//
+// The row buffer is a 128-byte half-row because a blit may be 128 wide, but a
+// sprite is not: an 8x8 tile reads eight bytes out of each of eight rows, and
+// fetching both 128-byte halves for every row pulled 2 KB through PSRAM for a
+// 64-byte copy. At four halfword accesses per 64-bit beat that is ~350 clocks
+// per half-row and ~5,700 clocks per tile -- and because the console's
+// clock-enable freezes while the engine waits on GRAM (rtl/gametank.sv), the
+// CPU lost over half of every frame. Cubicle Knight, whose wipe redraws with
+// ~50 tile blits a frame, fell behind the raster and left stale pixels on the
+// page (reference core: 935 stall clocks in a frame; this one: 259,000).
+//
+// So a narrow blit now fetches only the 16-byte window that holds the row's
+// source column, plus the neighbouring window when the source crosses it
+// (GCARRY walks x linearly; W[7] walks it backwards). 128-wide blits, and
+// anything wider than the window, keep the original whole-half streaming
+// fill, which is what the prefetcher was built for. A byte the engine asks
+// for that no window covers still takes the demand-miss path, which now also
+// fetches a single window at the byte it wants instead of a whole row.
+// ---------------------------------------------------------------------------
+wire [7:0]  blit_w  = (pW[6:0] == 8'd0) ? 8'd128 : {1'b0, pW[6:0]};
+wire [7:0]  src_x0  = pW[7] ? ~pGX : pGX;     // first source column of a row
+
+/* THE EXACT SET OF BEATS, NOT A NEIGHBOURHOOD (2026-11-05).
+ *
+ * The previous window was 16 bytes wide plus a 16-byte block on each side
+ * whenever `x_cross` was set, and `x_cross` included GCARRY (dma_ctl[4]).
+ * Every Cubicle Knight blit has GCARRY set, so an 8-pixel row fetched four
+ * beats -- 32 bytes for 8 used -- and the frame moved 2,388 beats where 816
+ * were needed. The engine was waiting on traffic it never read.
+ *
+ * The real set is a function of how gx advances inside a row:
+ *   - GCARRY (dma_ctl[4]) linear: the run is src_x0 .. src_x0+W-1, so beats
+ *     src_x0[6:3] .. (src_x0+W-1)[6:3] -- ONE beat for an aligned 8-pixel
+ *     sprite, two when it straddles an 8-byte boundary.
+ *   - otherwise the low nibble wraps (gcarry steps {v[7:4], v[3:0]+1}), so a
+ *     run of at most 16 columns never leaves its 16-pixel cell: both beats of
+ *     that cell.
+ *   - a mirrored row (W[7]) is the same cell for the same reason; NOT of a
+ *     nibble stays inside the nibble.
+ * A run that would cross the row's 128th column keeps the whole half-row.
+ */
+wire [7:0]  cell_a   = {src_x0[6:4], 4'h0};
+wire        run_lin  = dma_ctl[4] && !pW[7];
+wire [7:0]  run_last = run_lin ? (src_x0 + blit_w - 8'd1) : {src_x0[6:4], 4'hF};
+wire [7:0]  win_first = run_lin ? src_x0 : cell_a;
+wire [3:0]  win_lo   = win_first[6:3];
+wire [3:0]  win_hi   = run_last[6:3];
+wire        fill_narrow = (blit_w <= 8'd16) && (run_last <= 8'd127);
 
 // ---------------------------------------------------------------------------
 // Double row-buffer: 2 slots × 256 B (both gx-quadrant halves of one row)
@@ -174,8 +227,11 @@ st_e st;
 
 logic [7:0]  next_gy;        // raw engine gy of the next row to prefetch
 logic [7:0]  rows_left;
-logic        fill_slot;      // slot being filled
-logic        fill_half;      // which 128B half (gx'[7])
+logic        fill_slot;  // slot being filled
+logic        fill_half;  // which 128B half (gx'[7])
+logic        fill_wide;  // whole half-row fill
+logic [3:0]  fill_beat0; // first beat of the window
+logic [4:0]  fill_nbeats;// beats this fill moves
 logic [3:0]  beat_cnt;
 logic [63:0] fill_word;      // the beat being unpacked into the row buffer
 logic [2:0]  store_b;        // which of its bytes is going in this clock
@@ -190,6 +246,32 @@ logic [1:0]  init_fills;
 logic [10:0] last_fetch_tag;
 logic [10:0] last_req;
 logic        last_req_v;
+
+/* NEVER EVICT THE ROW BEING READ (2026-11-05).
+ *
+ * The fill slot was plain LRU, and LRU alternates -- so the third fill of a
+ * tile landed in the slot holding the row the engine had just started reading.
+ * The gate above only needs the engine to have TOUCHED row k before row k+1 is
+ * fetched, which is the correct "one row ahead" condition, but it says nothing
+ * about which slot is free. With two slots and an alternating pick, row k+2
+ * evicted row k+1 mid-read: measured 15 fills for an 8-row Cubicle Knight tile,
+ * i.e. seven demand misses of two beats each, and every one of them a pause
+ * the engine could not hide.
+ *
+ * Picking the slot that does NOT hold `last_req` is enough: the engine reads
+ * rows in order, so the row it is on is the only one that must stay, and the
+ * other slot holds the row it has finished. When neither slot holds it (a new
+ * trigger, the first fills) LRU is the right answer again.
+ */
+wire in_use0 = last_req_v && (tag[0] == last_req);
+wire in_use1 = last_req_v && (tag[1] == last_req);
+logic fill_pick;
+
+always_comb begin
+    fill_pick = lru;
+    if (in_use0 && !in_use1)      fill_pick = 1'b1;
+    else if (in_use1 && !in_use0) fill_pick = 1'b0;
+end
 
 // CPU channel latches
 logic        cpuw_pend, cpur_pend;
@@ -234,7 +316,7 @@ wire miss_redirect = blit_want && !dma_ctl[3] && !hit0 && !hit1 &&
 // The address is the same {slot, half, beat, byte} the read port uses, so a
 // half-written beat simply is not marked valid yet.
 assign rb_we    = (st == BURST_STORE);
-assign rb_waddr = {fill_slot, fill_half, beat_cnt, store_b};
+assign rb_waddr = {fill_slot, fill_half, (fill_beat0 + beat_cnt), store_b};
 assign rb_wdata = fill_word[7:0];
 
 always_ff @(posedge clk_sys) begin
@@ -248,6 +330,9 @@ always_ff @(posedge clk_sys) begin
         tag[1]    <= '1;
         lru       <= 1'b0;
         rows_left <= '0;
+        fill_wide <= 1'b0;
+        fill_beat0 <= '0;
+        fill_nbeats <= '0;
         cpuw_pend <= 1'b0;
         cpur_pend <= 1'b0;
         cpu_cache_v <= '0;
@@ -321,13 +406,17 @@ always_ff @(posedge clk_sys) begin
                     st           <= CPUR;
                 end
                 else if (miss_redirect) begin
-                    // self-heal: fetch the row the engine is actually asking for
+                    // self-heal: fetch the window holding the byte the engine
+                    // is actually asking for (one 16-byte block, not a row)
                     fill_row  <= want_row;
-                    fill_slot <= lru;
-                    fill_half <= 1'b0;
-                    tag[lru]  <= want_row;
-                    beatv[lru] <= '0;
-                    lru       <= ~lru;
+                    fill_slot <= fill_pick;
+                    fill_half <= blit_paddr[14];
+                    fill_wide <= 1'b0;
+                    fill_beat0 <= blit_paddr[6:3];
+                    fill_nbeats <= 5'd1;
+                    tag[fill_pick]  <= want_row;
+                    beatv[fill_pick] <= '0;
+                    lru       <= ~fill_pick;
                     last_fetch_tag <= want_row;
                     st        <= BURST_CMD;
                 end
@@ -337,11 +426,15 @@ always_ff @(posedge clk_sys) begin
                     // initial two rows fill freely; afterwards row k+1 only
                     // once the engine has reached row k (frees the lru slot)
                     fill_row  <= {banking[2:0], row_eff[7], row_eff[6:0]};
-                    fill_slot <= lru;
-                    fill_half <= 1'b0;
-                    tag[lru]  <= {banking[2:0], row_eff[7], row_eff[6:0]};
-                    beatv[lru] <= '0;
-                    lru       <= ~lru;
+                    fill_slot <= fill_pick;
+                    fill_half <= fill_narrow ? src_x0[7] : 1'b0;
+                    fill_wide <= ~fill_narrow;
+                    fill_beat0 <= fill_narrow ? win_lo : 4'd0;
+                    fill_nbeats <= fill_narrow ? ({1'b0, win_hi} - {1'b0, win_lo} + 5'd1)
+                                               : 5'd16;
+                    tag[fill_pick]  <= {banking[2:0], row_eff[7], row_eff[6:0]};
+                    beatv[fill_pick] <= '0;
+                    lru       <= ~fill_pick;
                     last_fetch_tag <= {banking[2:0], row_eff[7], row_eff[6:0]};
                     if (init_fills != 0) init_fills <= init_fills - 2'd1;
                     next_gy   <= gcarry(next_gy);
@@ -352,12 +445,12 @@ always_ff @(posedge clk_sys) begin
 
             BURST_CMD: begin
                 mem_rd       <= 1'b1;
-                // 128-byte half-row, as a PSRAM byte address:
-                // {fill_row[10:7], fill_half, fill_row[6:0]} << 7
+                // 128-byte half-row base plus the window's beat offset, as a
+                // PSRAM byte address: {row, half, gy} << 7  +  beat0 << 3
                 mem_addr     <= {3'd0, fill_row[10:7], fill_half,
-                                 fill_row[6:0], 7'b0};
+                                 fill_row[6:0], 7'b0} + (fill_beat0 << 3);
                 mem_be       <= 8'hFF;
-                mem_burstcnt <= 8'd16;
+                mem_burstcnt <= 8'(fill_nbeats);
                 beat_cnt     <= '0;
                 st           <= BURST_DATA;
             end
@@ -380,10 +473,10 @@ always_ff @(posedge clk_sys) begin
                 fill_word <= {8'h00, fill_word[63:8]};
                 store_b   <= store_b + 3'd1;
                 if (store_b == 3'd7) begin
-                    beatv[fill_slot][{fill_half, beat_cnt}] <= 1'b1;
+                    beatv[fill_slot][{fill_half, (fill_beat0 + beat_cnt)}] <= 1'b1;
                     beat_cnt <= beat_cnt + 4'd1;
-                    if (beat_cnt == 4'd15) begin
-                        if (!fill_half) begin
+                    if (beat_cnt == fill_nbeats - 5'd1) begin
+                        if (fill_wide && !fill_half) begin
                             fill_half <= 1'b1;
                             st <= BURST_CMD;
                         end

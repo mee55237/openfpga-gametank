@@ -1,11 +1,13 @@
 //============================================================================
 //  gt_save_slot -- the Pocket save slot's read side.
 //
-//  WHAT A GAMETANK SAVE IS. The console has no save RAM: a game stores its save
-//  in the cartridge's own flash, and the emulator (the compatibility floor)
-//  persists a diff of the cart image next to the ROM. So the save file IS the
-//  cartridge image, and the OS reads it back out of the 0x0200_0000 window at
-//  shutdown ([0080]) and writes it back in at boot ([0082]).
+//  WHAT A GAMETANK SAVE IS. A flash GameTank cartridge has no save RAM: a game
+//  stores its save in the cartridge's own flash, and the emulator (the
+//  compatibility floor) persists a diff of the cart image next to the ROM. So
+//  on that cart the save file IS the cartridge image, and the OS reads it back
+//  out of the 0x0200_0000 window at shutdown ([0080]) and writes it back in at
+//  boot ([0082]). (A Flash2M_RAM32K cart saves to its 32 KB SRAM instead; that
+//  is rtl/gt_nvram.sv, and rtl/core_top.v routes the same window there.)
 //
 //  THE WINDOW IS ADDRESSED, NOT SEQUENCED (2026-11-02). This is the one design
 //  rule the file exists to state, because the previous version broke it and the
@@ -13,9 +15,12 @@
 //
 //  The image lives in PSRAM and has to be streamed ahead: a PSRAM beat is ~80
 //  clk_core and the bridge wants a word every ~88 clk_74a, so the bytes are
-//  fetched in 16-beat bursts into a 2 KB buffer and a bridge read is answered
-//  from it. The buffer is INDEXED BY THE IMAGE WORD NUMBER -- image word W
-//  lives at `imgbuf[W % 256]` for as long as it is resident -- so the answer to
+//  fetched in 16-beat bursts into an 8 KB buffer (eight bursts) and a bridge
+//  read is answered from it -- and `[0080]` is not acknowledged until that
+//  buffer is FULL (see the ack, below), so a save-out of the whole image never
+//  depends on the stream keeping up with the host. The buffer is INDEXED BY
+//  THE IMAGE WORD NUMBER -- image word W lives at `imgbuf[W % WIN]` for as
+//  long as it is resident -- so the answer to
 //  a read is a function of its ADDRESS and nothing else. A word that is late,
 //  a word that is repeated, a read that arrives before the stream has started,
 //  a read that arrives while the window is being re-armed: all of them answer
@@ -31,12 +36,22 @@
 //  shift compounded: +4, then +8. "The save loads but it is partly corrupted"
 //  and "I have to load the cart twice" are the same four bytes.
 //
-//  THE ACK IS HONEST. `[0080]` blocks the OS until this module says word 0 is
-//  resident, and it must, because the OS starts reading the moment it is
-//  answered. It used to be granted immediately, which cost the first three words
-//  of every save (the stream needs ~200 clk_74a to produce the first burst). The
-//  ack now waits for the word, capped at 65,535 clk_74a (0.88 ms, sixteen times
-//  the fill) so a dead PSRAM still answers instead of hanging the menu.
+//  THE ACK IS WHAT MAKES THE READ RATE IRRELEVANT (2026-11-06). `[0080]` blocks
+//  the OS until this module answers, and the OS starts reading the moment it is
+//  answered -- so the ack waits until the WINDOW IS FULL, not until word 0 is
+//  there. That is not politeness, it is the property the .sav needs: an 8 KB
+//  image is 1,024 words and the window is 1,024 words, so by the time the host
+//  reads byte 0 the entire save is resident and how fast PSRAM produces the
+//  next word no longer matters. It does matter for a window that is acked at
+//  sixteen words: `Cubicle Knight.sav` from the 2026-11-05 build was 25%
+//  correct -- one burst of sixteen good words, three bursts of zero, repeating
+//  -- because the host consumed faster than a 2 KB window could be refilled
+//  between bursts. Every run in sim was green anyway, because
+//  tmp/gfx/sim/gt/psram_model.h answers with no wait states.
+//
+//  The wait is capped so a dead PSRAM answers instead of hanging the menu; the
+//  cap is a stopped-stream escape, well past a legitimate fill, and
+//  rtl/core_bridge_cmd.v's command watchdog is the outer bound on it.
 //
 //  FLUSH. A new request restarts the image at word 0. The toggle crosses three
 //  flops and the read side ignores the window for 48 clocks afterwards, so a
@@ -75,7 +90,111 @@ module gt_save_slot #(
      * and does not re-arm (see the arm condition below) -- re-arming there would
      * throw the head start away and hand the OS an empty window. */
     input  logic        pre_arm,        // the host has begun to shut us down
+
+    /* THE CORE'S OWN WRITER ARMS THE SAME STREAM (2026-11-07).
+     *
+     * rtl/gt_save_file.sv writes the image out with the host's [0184, which
+     * makes the HOST read this window -- so it needs exactly what `pre_arm`
+     * does (flush, start again at image word 0) and exactly what `pre_arm`
+     * cannot give it: a second arm while `pre_arm` is already high, which is a
+     * save that lands during the shutdown window. Sharing one input would
+     * swallow that rising edge, and the writer would then read a window that
+     * was never reset -- a wrong .sav rather than a failed one. */
+    input  logic        file_arm,       // the core's writer: arm, no ack
+    /* WHERE THE WRITER'S DATA STARTS (2026-11-08).
+     *
+     * A save only rewrites what the game changed, and what it changed is a span
+     * somewhere in the image -- on a 2 MB cartridge the last sectors. The stream
+     * used to be nailed to image word 0 (`file_arm` is a restart at zero), so
+     * asking for bytes at 0x1D0000 meant streaming 1.8 MB the host never reads.
+     * The write itself would still have been the same size, and the wait for it
+     * is the save time. So the arm takes the word to start at, and the fill
+     * begins there: `[rbin, wbin)` is the span the writer needs, nothing before
+     * it is ever fetched.
+     *
+     * It is a quasi-static word in the writer's own clock, sampled on the arm
+     * edge (the same edge that toggles the flush): the value is set a state
+     * before the toggle and does not move until the next save. Word 0 is the
+     * OS's read-out, and `pre_arm`/`req` keep it -- only `file_arm` uses this. */
+    input  logic [21:0] file_start,     // image word the writer's span begins at
+
+    /* A SAVE FILE THAT IS NOT THE WHOLE IMAGE (2026-11-09).
+     *
+     * A flash cartridge's save only ever differs from the .gtr from some low
+     * byte upwards, so the file is [the cartridge's own first 128 bytes][the
+     * image from `tail_word` to its end]. The head is there because the host
+     * validates a restore against the cartridge's first eight words before it
+     * lets a single byte through (rtl/core_top.v's SV_HEAD); without it a
+     * shorter file would be refused as "not this cartridge's save".
+     *
+     * So the window is not the image, it is the file: word 0 is the image's own
+     * word 0, the first HEAD_W words are the cartridge's head, and the word
+     * after them is image word `tail_word`. `tail_en` low is the shape every
+     * build before this one had -- the window is the image, word for word.
+     *
+     * THE HEAD IS ONE WHOLE BURST (2026-11-09). A burst is sixteen 8-byte
+     * entries fetched CONSECUTIVELY from the image, so a boundary that fell
+     * inside one would leave the rest of that burst holding the image where the
+     * file wanted the tail: with a four-entry head the first 96 bytes of every
+     * tail file were the cartridge's own bytes 32.. instead of the save. The
+     * fix is not a shorter burst, it is a head the same size as one -- 128
+     * bytes -- so the first burst is exactly the head and the second begins at
+     * the tail. sim/gt/tb_slot.cpp's 4e is that check.
+     *
+     * The window is still ADDRESSED, not sequenced (see the header): the file
+     * position the host names maps to an image word, and the answer is a
+     * function of that address alone.
+     */
+    input  logic        tail_en,        // the file is [head][tail], not the image
+    input  logic [21:0] tail_word,      // ... the tail's first image word
+
+    /* NOTHING TO READ OUT IS A LEGAL ANSWER, AND IT IS ZERO WORDS (2026-11-09).
+     *
+     * The framework's Dataslot ID/Size Table says how big the file is, and
+     * Analogue's reference defines the value: "Size of the data slot. Zero if
+     * the slot is not used." A flash cartridge that has not written since it
+     * was loaded is exactly that -- the file on the card already describes the
+     * cartridge -- so the core declares 0 rather than the 128-byte head it
+     * used to, and the OS has nothing to write.
+     *
+     * That makes the stream zero words long, and it must not wait for a window
+     * that will never fill: with `empty` the span below is 0 in both clocks, so
+     * no burst is issued, the ack fires as soon as the arm settles (48 clocks,)
+     * and `hold_console` never takes the CPU. The host asks `[0080]`, is told
+     * "ready", reads nothing, and sends `[008F]`. */
+    input  logic        empty,          // this slot holds no file at all
     output logic        ack,            // ... accepted, and word 0 is available
+
+    /* THE READ-OUT, AS A LEVEL THE MACHINE CAN BE HELD BY (2026-11-06).
+     *
+     * `ack` is a pulse and `stream_74a` runs before anyone asks, so neither
+     * says "the host is reading the image right now". This does: it rises on the
+     * request and falls when the host says `allcomplete`, which is exactly the
+     * window in which rtl/core_top.v holds the CPU. Without it the machine kept
+     * executing through the transfer and competed for the PSRAM port -- see the
+     * note at `save_stream` in rtl/core_top.v for the card measurement. */
+    output logic        readout,        // the host is reading the image out
+
+    /* THE CPU ONLY HAS TO BE OFF PSRAM WHILE THE WINDOW IS THIN (2026-11-07).
+     *
+     * This is an OUTPUT and not the readout itself because the two are not the
+     * same question. The readout lasts until the OS has written the file, card
+     * flush included; the hold is only needed while the stream has beats to
+     * fetch. Measured in sim/gt/tb_core_ss.cpp at the APF's own pace, a 2 MB
+     * `.sav` is 649.6 ms of read-out and the console was held for every
+     * millisecond of it -- plus every card write the OS does between chunks. A
+     * picture that has not moved for a second is what a crash looks like, and
+     * none of that hold buys anything once the window is full: the stream is
+     * parked (`room` low), issues nothing, and PSRAM is idle.
+     *
+     * So the hold follows the WINDOW, with hysteresis: taken back below
+     * HOLD_AT words resident, released at RUN_AT. Between the two the console
+     * runs and the host keeps draining, and the stream refills what that cost
+     * before the window is anywhere near empty. The margins are not close --
+     * HOLD_AT is 12 KB of a 16 KB window, i.e. 3.7 ms of the host's own reading
+     * at the measured 3.23 MB/s, while the 3 KB between the thresholds refills
+     * at a 6 MB/s port against a 3.2 MB/s drain. */
+    output logic        hold_console,   // keep the machine off the memory port
 
     // THE WRITER'S ARM IS GONE (2026-11-03). There used to be three ports here
     // -- `dump_arm`/`dump_thresh`/`dump_full` -- for rtl/gt_save_file.sv, which
@@ -100,23 +219,80 @@ module gt_save_slot #(
     input  logic        mem_dout_ready,
     input  logic        mem_busy,
 
+    /* THE WINDOW'S OCCUPANCY, FOR THE CORE'S OWN FILE WRITER (2026-11-07).
+     *
+     * rtl/gt_save_file.sv writes the image out itself with the host's [0184,
+     * which makes the HOST read this window -- so it has to be asked for a chunk
+     * only once that chunk is resident, or it reads zeros. This is the count it
+     * paces against; the threshold lives in the writer because only it knows how
+     * big the next command is. */
+    output logic [21:0] win_words,
+
     // ---- diagnostics ------------------------------------------------------
     output logic        underrun        // a read the stream had not produced
 );
 
-    localparam int WIN        = 256;                 // 64-bit entries (2 KB)
+    /* THE WINDOW IS THE IMAGE, WHEN THE IMAGE FITS (2026-11-06).
+     *
+     * It was 256 entries (2 KB) and it did not work on the card: the file came
+     * out one image word in four, byte-identically from two different fits, so
+     * it was not my control logic moving -- it was the host emptying a 2 KB
+     * window faster than PSRAM could refill it, and the window being the only
+     * buffer there is. The ratio is fixed by the host's own pace, so no amount
+     * of ack lead fixes it: 2 KB of lead is spent in the first 64 bytes of a
+     * 2 MB dump.
+     *
+     * 2,048 entries is 16 KB, which is THIRTEEN M10K blocks -- six more than
+     * the 8 KB window used, out of the nineteen the fit had spare. It is not a
+     * round number by accident: of the 40 cartridges on the card, ONE is 8 KB
+     * and twenty-three are 16 KB, so an 8 KB window left the common case
+     * streamed live past its first half -- which is the only place a hole can
+     * still come from. At 16 KB the whole save of every 16 KB cartridge (24 of
+     * 40) is resident before the host reads byte 0, and the read rate stops
+     * mattering for all of them. The ack waits for the full window (below), so
+     * for any image that fits, the host reads a buffer that was complete
+     * before it started -- independent of the fill rate, the host's pace, and
+     * whether the machine is held. Images larger than the window get 16 KB of
+     * lead, which is all a window can do for them. */
+    localparam int WIN        = 2048;                // 64-bit entries (16 KB)
     localparam int BURST_LEN  = 16;                  // 8-byte beats per request
-    localparam int HIGH_WATER = WIN - BURST_LEN;     // 240: last safe start
+    localparam int HIGH_WATER = WIN - BURST_LEN;     // 2032: last safe start
     localparam int IMG_WORDS  = IMG_BYTES / 8;       // 262,144
 
-    // THE ACK PROMISES A HEAD START, NOT A WORD (2026-11-02). `[0080]` is a
-    // command the OS blocks on, and the moment it is answered the OS reads the
-    // window as fast as its bridge allows. One resident word is enough to
-    // answer the first access and nothing else: the host then outruns the fill
-    // and the file gets a hole a few words in. Two bursts' worth is 256 bytes,
-    // ~200 us of PSRAM the OS does not feel, and it is what makes "the ack came
-    // back" mean "reading from here is safe" rather than "good luck".
-    localparam int ACK_WORDS  = BURST_LEN;
+    /* THE ACK IS "THE WINDOW IS FULL", NOT "ONE BURST IS IN" (2026-11-05).
+     *
+     * It was BURST_LEN -- sixteen words, 128 bytes -- so the OS was released
+     * with 128 bytes of lead and then had to be fed at its own pace for the
+     * rest of the image. Measured, the fill runs at 24.3 clk_core per 8-byte
+     * beat (9.4 MB/s, sim/gt/tb_slot.cpp's `fill` line), and the host takes a
+     * 4-byte word every ~80 clk_74a (3.7 MB/s), so the margin once the console
+     * is held is 2.5x -- but a margin is only a margin if it is ALLOWED to
+     * accumulate. Starting with 128 bytes spent it immediately. Starting with
+     * the whole 1,920-byte window, the stream has already banked five times the
+     * host's per-word jitter before the first read lands, and `room` keeps it
+     * there for the rest of the dump.
+     *
+     * The wait is 120 beats ~= 1.1 ms, inside the 65,535-clock cap below and
+     * inside the OS's patience for `[0080]` (every other core answers it at
+     * once because they have nothing to wait for). */
+    /* ... AND THE WATCHDOG IS LONGER THAN THE FILL (2026-11-06). The deadline
+     * was 65,535 clk_74a -- 0.88 ms -- which was fine for 240 words and is not
+     * for 1,008: the card's own file says the ack gave up at about 60 words, so
+     * the fill there is nearer a megabyte a second than the ten the model
+     * predicts, and 8 KB takes several milliseconds. This is the escape hatch
+     * for a PSRAM that is not answering at all, not a race against it. */
+    localparam int ACK_WORDS  = HIGH_WATER;
+    /* THE DEADLINE IS A DEAD-PSRAM ESCAPE, NOT A PACE (`1 in 4 words` on the
+     * card, 2026-11-06). At ~13 ms it was 2.6x the SIMULATED fill of one
+     * window -- and the simulation is the fast case, because
+     * tmp/gfx/sim/gt/psram_model.h answers with no wait states while the part
+     * inserts them. A deadline that fires in the middle of a legitimate fill
+     * is worse than no deadline at all: it acks a half-full window, the host
+     * reads past it, and the .sav comes out with holes -- exactly the file the
+     * card had. Four seconds-worth of clocks is only reached by a stream that
+     * has stopped, and rtl/core_bridge_cmd.v's own command watchdog is the
+     * outer bound on that. */
+    localparam logic [23:0] ACK_DEADLINE = 24'd4_000_000;   // ~54 ms at 74.25 MHz
 
     // ======================================================================
     //  The image window. Written in clk_core, read in clk_74a, addressed by
@@ -125,10 +301,11 @@ module gt_save_slot #(
     // ======================================================================
     (* ramstyle = "M10K, no_rw_check" *) logic [63:0] imgbuf [0:WIN-1];
 
-    // The registered read is what lets this infer as block RAM; the address is
-    // stable for the whole ~88-clk_74a bridge access, so one clock of latency
-    // is invisible to the host (it collects the word four clocks after the
-    // address is latched).
+    // The registered read is what lets this infer as block RAM; its address is
+    // the SERVED word (`srv_word`, below), which is fixed from the strobe that
+    // latched it until the next one, so the one clock of latency is invisible
+    // to the host -- it collects the word four clocks after the address is
+    // latched (see the timing note at `srv_word`).
     logic [63:0] win_q;
     logic        q_high = 1'b0;
     logic        q_hit  = 1'b0;
@@ -143,9 +320,11 @@ module gt_save_slot #(
     always_ff @(posedge clk_74a)
         flush_s74 <= {flush_s74[1:0], flush_tog};
 
+`ifdef GT_SIM
     // The pulse in each domain. `flush_74a` is also a probe: sim/gt/tb_slot.cpp
     // counts how many times the window was re-armed during a read-out.
     wire flush_74a = flush_s74[2] ^ flush_s74[1];
+`endif
 
     always_ff @(posedge clk_core)
         flush_s <= {flush_s[1:0], flush_s74[2]};
@@ -159,9 +338,10 @@ module gt_save_slot #(
     logic        start_pend = 1'b0;      // a request the ack still has to answer
     logic        stream_74a = 1'b0;      // ... and the command to go and fetch
     logic [5:0]  arm_hold   = 6'd0;      // window settling after a flush
-    logic [15:0] ack_wd     = 16'd0;     // the ack's escape hatch
+    logic [23:0] ack_wd     = 24'd0;     // the ack's escape hatch
     logic        req_q      = 1'b0;
     logic        arm_q      = 1'b0;      // pre_arm's edge, so the flush is one shot
+    logic        farm_q     = 1'b0;      // ... and the writer's, on its own input
 
 
 
@@ -210,6 +390,7 @@ module gt_save_slot #(
 
     wire         req_ev  = req & ~req_q;
     wire         pre_ev  = pre_arm & ~arm_q;
+    wire         file_ev = file_arm & ~farm_q;
 
     /* ... AND A REQUEST THAT ARRIVES AFTER THE PRE-ARM IS ANSWERED, NOT RESTARTED.
      * `already_armed` is "the stream is already sitting at image word 0 with
@@ -218,9 +399,49 @@ module gt_save_slot #(
     wire         rearm_now     = req_ev && !start_pend &&
                                  !(pre_arm && already_armed);
 
-    wire [21:0] rd_word = bridge_addr[24:3];     // image word the address names
+    /* THE WORD THE HOST TAKES IS THE ONE ITS PREVIOUS TRANSACTION NAMED
+     * (2026-11-06 -- and it is what the card has been saying all along).
+     *
+     * rtl/io_bridge_peripheral.v latches `pmp_addr` in ST_ADDR_0, counts four
+     * clocks in ST_READ_0 and takes `pmp_rd_data_e` there; `pmp_rd` rises one
+     * clock LATER, in ST_READ_1. So the strobe means "I have this word, advance
+     * to the next", and the framework's own reference reader uses it that way:
+     * refs/agg23-pocket-utils/ip/data_unloader.sv learns the address on
+     * `bridge_rd`'s rising edge -- one clock after the word was taken -- and
+     * fetches that word for the NEXT transaction. A reader built that way can
+     * only ever present the PREVIOUS address's data. That is the contract, and
+     * the host primes the pipe with one read it throws away.
+     *
+     * Answering from the live `bridge_addr` was therefore one word AHEAD. The
+     * .sav says so twice over: ALL 8,188 comparable bytes of `Cubicle Knight.sav`
+     * are the cartridge at +4 (not most -- every one), and its LAST word is
+     * 0x55555555, where the cartridge has 0x0000E1FC: that is the answer to
+     * 0x02002000, PSRAM past the end of an 8 KB cartridge. A host that only read
+     * the 2,048 words it wants could produce neither; one that reads the address
+     * after the last word it wants produces both, because that read is the one
+     * that lands past the image. (An earlier note here argued the address was stable at
+     * the sample and live addressing was right. It is stable -- that was never
+     * the question. The question is which address the host WANTS, and it is the
+     * previous one, because `data_unloader` cannot be off by one.)
+     *
+     * `srv_word`/`srv_high` are that address: latched at the strobe and served
+     * to the next transaction, cleared when a session is armed so the host's
+     * priming read is image word 0.
+     *
+     * `rd_stb` is the rising edge of the read pulse, and it is what the
+     * RETENTION pointer below must follow -- see `advance`. */
+    logic        rd_stb_q = 1'b0;
+    wire         rd_stb   = bridge_rd & ~rd_stb_q;
+
+    always_ff @(posedge clk_74a)
+        rd_stb_q <= bridge_rd;
+
+    wire [21:0] rd_word = bridge_addr[24:3];     // the word the NEXT access names
     wire        rd_high = bridge_addr[2];
     wire        addr2   = (bridge_addr[31:24] == 8'h02);
+
+    logic [21:0] srv_word = 22'd0;               // ... and the one this access takes
+    logic        srv_high = 1'b0;
 
     /* RESIDENT IS A RANGE, AND THAT IS ALL IT IS. `[rbin, wbin)` is what the
      * stream has produced: every one of those words is at `imgbuf[W % WIN]`,
@@ -230,15 +451,26 @@ module gt_save_slot #(
     wire resident = (rd_word >= rbin) && (rd_word < wbin_s);
     wire rd_hit   = addr2 && active && resident && (arm_hold == 6'd0);
 
-    wire [21:0] resident_words = wbin_s - rbin;
+    /* A BASE THAT IS NOT ZERO MAKES THE DIFFERENCE ABLE TO WRAP (2026-11-08).
+     * The stream now starts at the span's first word, so for the couple of
+     * clocks the gray-coded `wbin` takes to arrive, `wbin_s` is still BEHIND
+     * `rbin` -- and a subtraction there is 4 M words, not zero. That number is
+     * what the writer paces against (`win_words`), so it would fire the first
+     * chunk before a byte was fetched and the host would read zeros. Clamped,
+     * the same window is simply empty, which is what it is. */
+    wire [21:0] resident_words = (wbin_s >= rbin) ? (wbin_s - rbin) : 22'd0;
 
-    // Reads answer from the window one clock after their address, and the
+    assign win_words = resident_words;
+
+    wire srv_res = (srv_word >= rbin) && (srv_word < wbin_s);
+    wire srv_hit = addr2 && active && srv_res && (arm_hold == 6'd0);
+
+    // Reads answer from the SERVED word one clock after its address, and the
     // qualifiers ride with them so a word and its `hit` always belong together.
-    always_ff @(posedge clk_74a) begin
-        win_q  <= imgbuf[rd_word[7:0]];
-        q_high <= rd_high;
-        q_hit  <= rd_hit;
-    end
+    // It lives in the main FSM's `else` branch below, not in a block of its own:
+    // `srv_word` is also cleared by the reset and by the arm, and two always
+    // blocks driving one variable is a Quartus error (10028) even though the
+    // simulator accepts it.
 
     assign rd_data = q_hit ? (q_high ? win_q[63:32] : win_q[31:0]) : 32'h0;
 
@@ -257,7 +489,15 @@ module gt_save_slot #(
      *
      * A read that jumps backwards past that, or forwards out of range, answers
      * zero; the OS reads 2 MB from word 0 to the end and never does either. */
-    wire advance = rd_hit && (rd_word >= rbin + 22'd8);
+    wire advance = rd_stb && rd_hit && (rd_word >= rbin + 22'd8);
+
+    /* Where this session's file ends, in the host's own clock: the head's words
+     * plus the tail. `tail_en`/`tail_word` are arm-time values, so this is too. */
+    localparam int HEAD_W = 16;         // 128 bytes: the cartridge's first burst
+    wire [21:0] span_words_74 = empty ? 22'd0
+                              : tail_en
+                              ? (22'(HEAD_W) + 22'(IMG_WORDS) - tail_word)
+                              : 22'(IMG_WORDS);
 
     always_ff @(posedge clk_74a) begin
         if (reset_74a) begin
@@ -266,17 +506,36 @@ module gt_save_slot #(
             stream_74a <= 1'b0;
             arm_hold   <= 6'd0;
             ack        <= 1'b0;
-            ack_wd     <= 16'd0;
+            ack_wd     <= 24'd0;
             req_q      <= 1'b0;
             arm_q      <= 1'b0;
             rbin       <= 22'd0;
+            srv_word   <= 22'd0;
+            srv_high   <= 1'b0;
             underrun   <= 1'b0;
+            readout    <= 1'b0;
         end else begin
             ack    <= 1'b0;
             req_q  <= req;
             arm_q  <= pre_arm;
+            farm_q <= file_arm;
 
-            if (ack_wd != 16'd0)   ack_wd   <= ack_wd - 16'd1;
+            /* THE READOUT, in the arm's own block so one always_ff owns
+             * `srv_word`: the strobe latches the address the host sent, and the
+             * RAM port answers from it for the rest of the transaction (the
+             * arm below overrides both on the same clock, which is what makes
+             * the host's priming read image word 0). */
+            if (rd_stb) begin
+                srv_word <= rd_word;
+                srv_high <= rd_high;
+            end
+            win_q  <= imgbuf[srv_word[10:0]];
+            q_high <= srv_high;
+            q_hit  <= srv_hit;
+
+            if (req_ev) readout <= 1'b1;
+
+            if (ack_wd != 24'd0)   ack_wd   <= ack_wd - 24'd1;
             if (arm_hold != 6'd0)  arm_hold <= arm_hold - 6'd1;
 
             /* A SECOND REQUEST WHILE THE FIRST IS UNANSWERED IS THE SAME
@@ -303,10 +562,14 @@ module gt_save_slot #(
              * IMG_WORDS, so it ends at the last word of the image by itself, and
              * a new `[0080]` re-arms it from word 0 because the arm is the
              * request. */
-            if (rearm_now || pre_ev) begin
+            if (rearm_now || pre_ev || file_ev) begin
                 flush_tog  <= ~flush_tog;
                 active     <= 1'b1;
-                rbin       <= 22'd0;
+                // The OS's read-out always starts at word 0; the core's writer
+                // starts wherever the bytes it has to write begin.
+                rbin       <= file_ev ? file_start : 22'd0;
+                srv_word   <= file_ev ? file_start : 22'd0;
+                srv_high   <= 1'b0;
                 stream_74a <= 1'b0;
                 arm_hold   <= 6'd48;
                 underrun   <= 1'b0;
@@ -317,13 +580,13 @@ module gt_save_slot #(
                  * command the framework waits on forever. */
                 if (rearm_now) begin
                     start_pend <= 1'b1;
-                    ack_wd     <= 16'd65535;
+                    ack_wd     <= ACK_DEADLINE;
                 end
             end else begin
                 /* THE PRE-ARMED REQUEST: no flush, only the ack it is owed. */
                 if (req_ev && !start_pend) begin
                     start_pend <= 1'b1;
-                    ack_wd     <= 16'd65535;
+                    ack_wd     <= ACK_DEADLINE;
                 end
 
                 if (arm_hold == 6'd1)
@@ -341,6 +604,7 @@ module gt_save_slot #(
                 if (allcomplete) begin
                     active     <= 1'b0;
                     stream_74a <= 1'b0;
+                    readout    <= 1'b0;
                 end
             end
 
@@ -351,8 +615,25 @@ module gt_save_slot #(
              * and starts reading, so an empty window here is a zero header and
              * two more zero words before the stream catches up. The cap is the
              * escape hatch for a PSRAM that is not answering. */
+            /* ... AND A CART SMALLER THAN THE WINDOW IS ANSWERED WHEN IT ENDS
+             * (2026-11-06). `ACK_WORDS` is "a full window of lead", which an
+             * 8 KB image reaches before its last word. A 4 KB image never
+             * does: its whole content is 512 words, the stream stops at
+             * IMG_WORDS, and the only thing left to fire the ack would be the
+             * deadline -- 13 ms of the OS waiting on every single save-out.
+             * `wbin` ending AT the image is the same statement the window
+             * count makes, for an image that fits. */
+            /* `empty` IS ITS OWN ANSWER (2026-11-09). The ack and the hold are
+             * both keyed on the window reaching `span_words_74`, and the window
+             * starts at `file_start` -- the core writer's span base, which is
+             * NOT reset by a cartridge reload. A slot that holds nothing has no
+             * window to wait for at all, so it short-circuits both: nothing to
+             * fetch, nothing to hold the console for, one clock to answer. */
             if (start_pend && (arm_hold == 6'd0) &&
-                ((resident_words >= 22'(ACK_WORDS)) || (ack_wd == 16'd1))) begin
+                (empty ||
+                 (resident_words >= 22'(ACK_WORDS)) ||
+                 (wbin_s == span_words_74) ||
+                 (ack_wd == 24'd1))) begin
                 ack        <= 1'b1;
                 start_pend <= 1'b0;
             end
@@ -367,11 +648,34 @@ module gt_save_slot #(
              * every idle clock an underrun the moment the window becomes live --
              * measured: the flag rose at byte 0 of a sweep that had not started
              * yet. */
-            if (bridge_rd && addr2 && !rd_hit && active && (arm_hold == 6'd0) &&
-                (resident_words != 22'd0) && (rd_word > rbin) &&
-                (rd_word < rbin + 22'(WIN)))
+            if (bridge_rd && addr2 && !srv_hit && active && (arm_hold == 6'd0) &&
+                (resident_words != 22'd0) && (srv_word > rbin) &&
+                (srv_word < rbin + 22'(WIN)))
                 underrun <= 1'b1;
         end
+    end
+
+    /* ---- the console's hold, decided in the host's own clock -------------
+     *
+     * `resident_words` is the 74.25 MHz side's view of the window, which is the
+     * side that knows what the host has taken. Held by default (`active` low or
+     * a flush still settling), released only when there is nothing left to
+     * fetch or the window is nearly full again -- never on a level that could
+     * oscillate every clock, which is what the two thresholds are for. */
+    localparam int HOLD_AT = 1536;      // words resident: take the CPU back
+    localparam int RUN_AT  = 1920;      // words resident: let it run
+
+    always_ff @(posedge clk_74a) begin
+        if (reset_74a || !active)
+            hold_console <= 1'b1;
+        else if (arm_hold != 6'd0)
+            hold_console <= 1'b1;       // the window is still settling
+        else if (empty || (wbin_s == span_words_74))
+            hold_console <= 1'b0;       // nothing to fetch, or all of it is here
+        else if (resident_words <= 22'(HOLD_AT))
+            hold_console <= 1'b1;
+        else if (resident_words >= 22'(RUN_AT))
+            hold_console <= 1'b0;
     end
 
     /* A SESSION SURVIVES THE HOST'S SILENCE (`[0080]` ends it, and a new arm
@@ -399,8 +703,12 @@ module gt_save_slot #(
 
     always_ff @(posedge clk_core) begin
         if (flush_core) begin
-            rgray_s1 <= 22'd0;
-            rgray_s2 <= 22'd0;
+            // Seed the read base with the span's start, not zero: `room` is
+            // `wbin - rbin_s`, so a zeroed base against a `wbin` that begins at
+            // 0x3A000 would look like 232 KB of used window and the fill would
+            // never issue a burst.
+            rgray_s1 <= (file_start >> 1) ^ file_start;
+            rgray_s2 <= (file_start >> 1) ^ file_start;
         end else begin
             rgray_s1 <= rgray;
             rgray_s2 <= rgray_s1;
@@ -421,9 +729,44 @@ module gt_save_slot #(
     st_t         sst  = S_IDLE;
     logic [3:0]  beat = 4'd0;
 
+    /* The file position -> the image word it is holding (2026-11-09). Four
+     * words of head, then the tail from `tail_word`. The two are quasi-static
+     * together (they change with the arm, not inside a transfer), so they cross
+     * with two flops apiece like every other arm-time value here. */
+    logic        tail_en_s1 = 1'b0, tail_en_s2 = 1'b0;
+    logic [21:0] tail_w_s1  = 22'd0, tail_w_s2  = 22'd0;
+
+    always_ff @(posedge clk_core) begin
+        tail_en_s1 <= tail_en;
+        tail_en_s2 <= tail_en_s1;
+        tail_w_s1  <= tail_word;
+        tail_w_s2  <= tail_w_s1;
+    end
+
+    logic        empty_s1 = 1'b0, empty_s2 = 1'b0;
+
+    always_ff @(posedge clk_core) begin
+        empty_s1 <= empty;
+        empty_s2 <= empty_s1;
+    end
+
+    wire [21:0] tail_w_c = tail_w_s2;
+    wire [21:0] span_words_c = empty_s2 ? 22'd0
+                             : tail_en_s2
+                             ? (22'(HEAD_W) + 22'(IMG_WORDS) - tail_w_c)
+                             : 22'(IMG_WORDS);
+
+    wire [21:0] img_w = !tail_en_s2            ? wbin
+                      : (wbin < 22'(HEAD_W)) ? wbin
+                      : (tail_w_c + (wbin - 22'(HEAD_W)));
+
+    /* ... and the file word `tail_word` names is the head's first word, so the
+     * head can never overlap the tail: a tail base below 128 bytes would make
+     * the file longer than the image it describes. */
+
     // IMG_BASE is a byte address and the word index is the count of 8-byte
     // entries, so the stream's own address is base + word * 8.
-    wire [21:0] saddr = IMG_BASE + 22'(wbin << 3);
+    wire [21:0] saddr = IMG_BASE + 22'(img_w << 3);
 
     logic [1:0] stream_s = 2'b0;
     always_ff @(posedge clk_core)
@@ -444,11 +787,11 @@ module gt_save_slot #(
             beat <= 4'd0;
         end else if (flush_core) begin
             sst  <= S_IDLE;
-            wbin <= 22'd0;
+            wbin <= file_start;
             beat <= 4'd0;
         end else case (sst)
             S_IDLE: begin
-                if (stream_core && room && (wbin < 22'(IMG_WORDS)))
+                if (stream_core && room && (wbin < span_words_c))
                     sst <= S_ISSUE;
             end
             S_ISSUE: begin
@@ -472,20 +815,22 @@ module gt_save_slot #(
     // Every beat goes into the window at the word number it was fetched for.
     always_ff @(posedge clk_core) begin
         if ((sst == S_BEATS) && mem_dout_ready)
-            imgbuf[wbin[7:0]] <= mem_dout;
+            imgbuf[wbin[10:0]] <= mem_dout;
     end
 
+`ifdef GT_SIM
     /* ------------------------------------------------------------------ *
      * PROBES the harnesses read (sim/gt/gt_slot_top.sv). They are the facts
      * about the window, not leftovers: "is there anything to answer with",
      * "how much", and "the word that was last presented".
      * ------------------------------------------------------------------ */
     wire        fifo_empty  = (resident_words == 22'd0);
-    wire [8:0]  fifo_wcount = resident_words[8:0];
+    wire [10:0] fifo_wcount = resident_words[10:0];
     wire [63:0] fifo_q      = win_q;
     wire [21:0] head_idx    = rbin;
     wire [63:0] hold        = 64'd0;
     wire        have_word   = 1'b0;
+`endif
 
 endmodule
 
