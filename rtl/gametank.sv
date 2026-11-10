@@ -546,7 +546,9 @@ logic         via_ss_we;
 // live 6522 returns timer values, pin states and IFR bits there, so its level
 // generator comes out different. That difference is the machine's, not a bug.
 logic [7:0] via_shadow [0:15];
-wire  [7:0] via_shadow_q = via_shadow[win_addr[3:0]];
+// The array itself is still live: `via_pa` (register 1) drives the cartridge
+// bank SPI. `via_shadow_q`, the read-byte alias, went with the shadow reads
+// (2026-11-09) -- nothing has read it since the real 6522 started answering.
 always_ff @(posedge clk_sys) begin
     if (reset) begin
         for (int i = 0; i < 16; i++) via_shadow[i] <= 8'h00;

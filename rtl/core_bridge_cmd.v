@@ -168,12 +168,15 @@ end
     reg     [31:0]  host_20; // parameter data
     reg     [31:0]  host_24;
     reg     [31:0]  host_28;
-    reg     [31:0]  host_2C;
+    // 0x2C is not decoded: the host may write it, nothing in this core reads
+    // it, and a register nothing reads is 32 flops of nothing (2026-11-09).
 
     reg     [31:0]  host_40; // response data
     reg     [31:0]  host_44;
     reg     [31:0]  host_48;
-    reg     [31:0]  host_4C;
+    // 0x4C has no producer: there is no third response word. The read below
+    // answers 0 for it explicitly, which is what an undriven register gave
+    // (2026-11-09).
 
     reg             host_cmd_start;
     reg     [15:0]  host_cmd_startval;
@@ -228,10 +231,10 @@ localparam  [22:0]  HOST_WD_MAX     = 23'h7F_FFFF;
     reg     [31:0]  target_28;
     reg     [31:0]  target_2C;
 
-    reg     [31:0]  target_40; // response data
-    reg     [31:0]  target_44;
-    reg     [31:0]  target_48;
-    reg     [31:0]  target_4C;
+    // 0x40-0x4C hold the TARGET's response words, which the host writes and a
+    // core reads when it has target commands that return data. This one has
+    // none (its [0184/0188/0190/0192 answers go back through host_40/44), so
+    // the four registers were write-only and are gone (2026-11-09).
 
 localparam  [3:0]   TARG_ST_IDLE        = 'd0;
 localparam  [3:0]   TARG_ST_READYTORUN  = 'd1;
@@ -431,7 +434,7 @@ always @(posedge clk) begin
     end
 
     b_datatable_wren <= 0;
-    b_datatable_addr <= bridge_addr >> 2;
+    b_datatable_addr <= bridge_addr[11:2];   // (addr >> 2), low 10 bits
 
     if(bridge_wr) begin
         casex(bridge_addr)
@@ -449,7 +452,6 @@ always @(posedge clk) begin
             8'h20: host_20 <= bridge_wr_data_in; // parameter data regs
             8'h24: host_24 <= bridge_wr_data_in;
             8'h28: host_28 <= bridge_wr_data_in;
-            8'h2C: host_2C <= bridge_wr_data_in;
             endcase
         end
         32'hF8xx10xx: begin
@@ -457,10 +459,6 @@ always @(posedge clk) begin
             8'h0: target_0 <= bridge_wr_data_in; // command/status
             8'h4: target_4 <= bridge_wr_data_in; // parameter data pointer
             8'h8: target_8 <= bridge_wr_data_in; // response data pointer
-            8'h40: target_40 <= bridge_wr_data_in; // response data regs
-            8'h44: target_44 <= bridge_wr_data_in;
-            8'h48: target_48 <= bridge_wr_data_in;
-            8'h4C: target_4C <= bridge_wr_data_in;
             endcase
         end
         32'hF8xx2xxx: begin
@@ -478,7 +476,7 @@ always @(posedge clk) begin
             8'h40: bridge_rd_data_out <= host_40; // response data regs
             8'h44: bridge_rd_data_out <= host_44;
             8'h48: bridge_rd_data_out <= host_48;
-            8'h4C: bridge_rd_data_out <= host_4C;
+            8'h4C: bridge_rd_data_out <= 32'd0; // no third response word
             endcase
         end
         32'hF8xx10xx: begin
@@ -743,7 +741,7 @@ always @(posedge clk) begin
      * state over. RTR is out of the count now, and the state has no exit but
      * the host's `ok` (see TARG_ST_WAITRESULT_RTR). */
     if(tstate == TARG_ST_DATASLOTOP || tstate == TARG_ST_WAITRESULT_DSO) begin
-        if(targ_wd != TARG_WD_MAX) targ_wd <= targ_wd + 1;
+        if(targ_wd != TARG_WD_MAX) targ_wd <= targ_wd + 27'd1;
     end else
         targ_wd <= 0;
 

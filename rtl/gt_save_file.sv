@@ -491,7 +491,6 @@ module gt_save_file #(
      * F_BAD, cleared by a full write that reaches the flush. */
     logic        resync  = 1'b0;
     logic [31:0] img_q   = 32'd0;      // a different cartridge is a different file
-    logic [2:0]  err_q   = 3'd0;
     logic [8:0]  clr_i   = 9'd0;
     logic [8:0]  scan_i  = 9'd0;        // byte index into our path
     logic [8:0]  len_b   = 9'd0;        // its length, NUL not included
@@ -501,12 +500,15 @@ module gt_save_file #(
 
     /* THIS PASS IS A LOAD, NOT A SAVE (2026-11-07).
      *
-     * The Save slot is no longer nonvolatile: the OS neither loads it at launch
-     * nor reads it out at shutdown, so this module owns the file outright and
-     * the console's save has to be put back before the console boots. The pass
-     * is the same walk -- slot 1's path, the suffix, the struct window -- and
-     * the same slot-2 channel; only the direction of the data command changes
-     * ([0180 in, [0184 out) and the file is opened without create/resize.
+     * It is the FALLBACK, not the usual path (2026-11-09): the slot is
+     * nonvolatile again, so the framework streams the .sav into the core at
+     * launch and this pass is armed only when it did not -- `!slot2_seen &&
+     * !slot2_hit` in rtl/core_top.v -- and never on a cartridge whose save may
+     * have a tail (`sf_tail_cart`). Then the file has to be read and put back
+     * before the console boots. The pass is the same walk -- slot 1's path, the
+     * suffix, the struct window -- and the same slot-2 channel; only the
+     * direction of the data command changes ([0180 in, [0184 out) and the file
+     * is opened without create/resize.
      *
      * `lmode` is what the shared states test: F_NAME opens for reading instead
      * of writing, and the struct window answers flags 0 and size 0 (open the
@@ -531,7 +533,6 @@ module gt_save_file #(
     logic [1:0]  pf_i      = 2'd0;      // which prefix word is under the check
     logic [8:0]  sh_i      = 9'd0;      // destination byte index of the copy
     logic [31:0] sh_acc    = 32'd0;     // the destination word being assembled
-    logic        load_done_q = 1'b0;    // its rising edge is the `load_done` pulse
 
     // The bridge's view of the window: paths out of the array, the two words
     // after each path out of registers (they are constants here).
@@ -641,7 +642,7 @@ module gt_save_file #(
     // name writer needs. All 9-bit arithmetic: a path is 256 bytes.
     wire [7:0]  scw     = 8'(B_WORD) + scan_i[7:2];
     wire [31:0] scword  = fs_word;
-    wire [7:0]  scbyte  = scword >> {scan_i[1:0], 3'b000};
+    wire [7:0]  scbyte  = scword[{scan_i[1:0], 3'b000} +: 8];
 
     wire [8:0]  nw_i    = dot_q + nam_i;
     wire [7:0]  nw_word = 8'(B_WORD) + nw_i[8:2];
@@ -756,7 +757,6 @@ module gt_save_file #(
             img_q      <= 32'd0;
             span_req   <= 1'b0;
             slot_start <= 22'd0;
-            err_q      <= 3'd0;
             clr_i      <= 9'd0;
             scan_i     <= 9'd0;
             len_b      <= 9'd0;
@@ -1004,7 +1004,6 @@ module gt_save_file #(
 
             F_LOPENHIGH: begin
                 if (t_done) begin
-                    err_q <= t_err;
                     sent  <= 32'd0;
                     if (t_err <= 3'd1) begin
                         fst <= F_LCHUNK;
@@ -1054,7 +1053,6 @@ module gt_save_file #(
 
             F_LRDHIGH: begin
                 if (t_done) begin
-                    err_q <= t_err;
                     if (t_err == 3'd0) begin
                         sent <= sent + chunk;
                         fst  <= F_LCHUNK;
@@ -1110,7 +1108,6 @@ module gt_save_file #(
 
             F_GETAHIGH: begin
                 if (t_done) begin
-                    err_q  <= t_err;
                     scan_i <= 9'd0;
                     fst    <= (t_err == 3'd0) ? F_SCANA : F_GETB;
                 end
@@ -1167,7 +1164,6 @@ module gt_save_file #(
 
             F_GETBHIGH: begin
                 if (t_done) begin
-                    err_q  <= t_err;
                     scan_i <= 9'd0;
                     fst    <= (t_err == 3'd0) ? F_LEN : F_BAD;
                 end
@@ -1358,7 +1354,6 @@ module gt_save_file #(
 
             F_OPENHIGH: begin
                 if (t_done) begin
-                    err_q <= t_err;
                     // 0 = opened, 1 = created and opened (documented as success)
                     if (t_err <= 3'd1) begin
                         /* ... and a file this call CREATED holds nothing that is
@@ -1463,7 +1458,6 @@ module gt_save_file #(
 
             F_WRHIGH: begin
                 if (t_done) begin
-                    err_q <= t_err;
                     if (t_err == 3'd0) begin
                         sent <= sent + chunk;
                         fst  <= F_CHUNK;

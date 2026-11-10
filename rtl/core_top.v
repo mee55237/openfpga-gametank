@@ -1399,7 +1399,7 @@ module core_top (
   wire [21:0] sv_tword_q = sv_lo_use_q[21:3];
 
   always @(posedge clk_74a) begin
-      sv_cs_q     <= {1'b0, cart_size};
+      sv_cs_q     <= cart_size;
       sv_ram_q    <= ram32k_s;
 
       sv_lo_use_q <= (sv_lo > sv_cs_q) ? sv_cs_q : sv_lo;
@@ -2101,46 +2101,22 @@ module core_top (
   // debug tag: a save that arrives and is not counted is a save that did not.
   reg  [21:0] save_bytes /* verilator public_flat_rd */ = 22'd0;
 
-  /* ---- IS THE FILE ON THE CARD THIS IMAGE? (2026-11-08) -----------------
+  /* ---- THE WRITER IS TOLD NOTHING ABOUT THE FILE (2026-11-09) -----------
    *
-   * The span write in rtl/gt_save_file.sv is only safe while the `.sav` holds
-   * the same bytes as the image; otherwise the bytes outside the span would
-   * stay as whatever the file had. At launch the OS loads the slot's file INTO
-   * the core ([0082] + the bytes + [008F]), so a load whose declared size is the
-   * cartridge's own size, and that the probe above accepted whole, leaves the
-   * image and the file identical -- and that is exactly what this records.
+   * rtl/gt_save_file.sv's `known` lets a save write only the changed span,
+   * which is safe only if the `.sav` already holds every byte outside it. A
+   * launch load does not establish that: it delivers a whole-image file and a
+   * head+tail file identically -- the same [0082], the same declared length,
+   * the same bytes -- and nothing in the stream says which one arrived. So
+   * `file_ok` is tied to 0 at the instance and the first save of a session
+   * writes the whole image, exactly as it does when there is no file at all.
    *
-   * A save file that does not exist is never loaded, so no [0082] arrives for
-   * slot 2 and this stays low: the first save writes the whole image. A file of
-   * another size, a refused restore (the probe drops it), and a different
-   * cartridge all leave it low for the same reason -- the file is not known to
-   * be the image, so the writer may not assume it is. */
-  reg         sf_open2  = 1'b0;
-  reg  [21:0] sf_req_size = 22'd0;
-  reg  [15:0] sf_refused  = 16'd0;
-  reg  [31:0] sf_size_q   = 32'hFFFF_FFFF;
-  reg         sf_file_ok  = 1'b0;
-
-  always @(posedge clk_74a) begin
-    if (req_start && (dataslot_requestwrite_id == 16'd2)) begin
-      sf_open2      <= 1'b1;
-      sf_req_size   <= dataslot_requestwrite_size[21:0];
-      sf_refused    <= save_refused;
-      sf_file_ok    <= 1'b0;
-    end
-    // A different cartridge is a different .sav, whatever the last one was.
-    if (save_slot_size != sf_size_q) begin
-      sf_size_q  <= save_slot_size;
-      sf_file_ok <= 1'b0;
-    end
-    if (dataslot_allcomplete) begin
-      if (sf_open2 && (sf_req_size == save_slot_size[21:0]) &&
-          (save_refused == sf_refused) && (save_slot_size != 32'd0))
-        sf_file_ok <= 1'b1;
-      sf_open2 <= 1'b0;
-    end
-  end
-
+   * The probe that used to compute this lived here and compared the requested
+   * size against the DECLARED size, which is true of both formats and so
+   * proved nothing; it was removed rather than left reading as a guarantee.
+   * Distinguishing them is possible (`cart_size` is one of the two lengths)
+   * but it changes when a whole-image write is allowed to become a span write,
+   * so it is a decision to make against a harness, not a tidy-up. */
 
   /* A SAVE THAT IS NOT AN IMAGE MUST NEVER BE RESTORED (2026-10-31).
    *
@@ -2385,7 +2361,7 @@ module core_top (
                              (sv_req_size > 22'd128) &&
                              (sv_req_size < {1'b0, cart_size}) &&
                              (sv_req_size[2:0] == 3'b000);
-  wire [21:0] sv_pack_lo   = {1'b0, cart_size} - (sv_req_size - 22'd128);
+  wire [21:0] sv_pack_lo   = cart_size - (sv_req_size - 22'd128);
 
   reg  [1:0]  sv_req_q    = 2'b00;
   reg  [20:0] worm_lo_s1  = 21'h1F_FFFF, worm_lo_s2 = 21'h1F_FFFF;
