@@ -38,14 +38,16 @@
 //  the raster to the console's frame boundary, because the boundary is
 //  absorbed by a buffer instead of by blanking arithmetic.
 //
-//  THE OUTPUT IS EXACTLY 128x128 ACTIVE PIXELS. That is the whole contract
-//  with the APF scaler: the Pocket upscales 128x128 to its 1600x1440 panel
-//  itself, and the core must NOT pad, letterbox, centre or scale anything.
-//  There is no border here, no 246-line window and no 748-dot line: video_de
-//  is high for 128 dots on 128 lines and low everywhere else. (An earlier
+//  THE OUTPUT IS 128x128 ACTIVE PIXELS, OR 128x100 IN TV MODE. That is the
+//  whole contract with the APF scaler: the Pocket upscales the active window
+//  to its 1600x1440 panel itself, and the core must NOT pad, letterbox,
+//  centre or scale anything. There is no border here, no 246-line window and
+//  no 748-dot line: video_de is high for 128 dots on 128 lines in the full
+//  mode, and on 100 lines at the frame origin in TV mode. (An earlier
 //  revision of this file emitted a bordered 748x246 window because it reused
 //  gtvideo's own geometry; that is exactly wrong for the APF and is what this
 //  file replaces.)
+
 //
 //  RASTER: 150 dots x 250 lines, of which 128 x 128 is picture. THE LINE AND
 //  FRAME RATES ARE rtl/mc64_video.sv's, because that is the signal proven on
@@ -115,8 +117,10 @@
 
 module gt_video #(
     // ---- geometry, in pixel periods (mc64_video's parameter names) ----
-    parameter int H_ACT   = 128,   // picture width
+        parameter int H_ACT   = 128,   // picture width
     parameter int V_ACT   = 128,   // picture lines
+    parameter int V_ACT_TV = 100,  // TV mode: 100 visible lines (128x100)
+    parameter int V_CROP_TV = 14,  // TV mode: first framebuffer row (14..113)
     parameter int H_TOTAL = 150,   // 128 picture + 22 blank: mc64's 15 kHz line
     parameter int V_TOTAL = 250,   // 128 picture + 122 blank: mc64's 250 lines
     parameter int HS_END  = 150,   // HS: one dot, H_TOTAL-2, every line
@@ -194,13 +198,17 @@ module gt_video #(
     input  logic        frame_sync, // console vsync level (vsync_nmi); the
                                     // rising edge is the frame boundary
 
-    /* TV MASK, from pocket/interact.json via core_top. The console's picture
+    /* TV MODE, from pocket/interact.json via core_top. The console's picture
      * is 128 lines, but a real television only showed the middle 100: rows
-     * 0..13 and 114..127 are overscan. With this bit set, those rows carry no
-     * active data, so the scaler captures a 128x100 window and the rows arrive
-     * as black border. The raster, HS and VS do not move -- the scaler must
-     * keep locking to the same 250-line, 60 Hz frame. */
+     * 14..113. With this bit set the active window is 100 lines AT THE FRAME
+     * ORIGIN -- scanout line 0 reads framebuffer row 14 -- so the scaler's
+     * 100-line slot 1 capture (128x100, 32:25) starts on the first line of
+     * picture instead of 14 blank ones, and the blanking carries the slot-1
+     * end-of-line request. With it clear the output is the full 128 lines of
+     * slot 0. The raster, HS and VS do not move: the scaler must keep locking
+     * to the same 250-line, 60 Hz frame either way. */
     input  logic        tv_mask,
+
 
     // ---- APF video ------------------------------------------------------
     output logic [23:0] video_rgb,
@@ -340,15 +348,19 @@ wire [7:0] va    = wrap3 ? (v_last ? 8'd0 : v + 8'd1) : v;
 wire [7:0] px = ha - 8'(H_OFF);
 wire [7:0] py = va - 8'(V_OFF);
 
-wire de_now = (px < 8'(H_ACT)) && (py < 8'(V_ACT));
+/* THE TV WINDOW (2026-11-11). In TV mode the active picture is 100 lines and
+ * it starts at the FRAME ORIGIN, not at row 14: the scaler anchors its capture
+ * on VS, so a window that begins with 14 blank lines would be cropped 14 lines
+ * at the bottom. Instead the line count changes (100 vs 128) and the frame
+ * store read adds V_CROP_TV, so scanout line 0 carries framebuffer row 14 and
+ * line 99 carries row 113. The raster, HS and VS do not move -- only DE and
+ * the read address -- so the scaler keeps locking to the same 250-line frame. */
+wire [7:0] v_act_eff  = tv_mask ? 8'(V_ACT_TV)  : 8'(V_ACT);
+wire [7:0] v_crop_eff = tv_mask ? 8'(V_CROP_TV) : 8'd0;
 
-/* THE 14-ROW OVERSCAN BANDS (2026-11-11). `py` is the picture row the
- * lookahead address belongs to, so gating de_now here keeps the mask aligned
- * with the three-stage output pipeline below. Only DE is lowered; RGB is
- * already forced to zero wherever DE is low, and HS/VS stay exactly where the
- * scaler expects them. Rows 14..113 remain: 100 lines, 128x100. */
-wire tv_overscan = (py < 8'd14) || (py > 8'd113);
-wire de_act      = de_now & ~(tv_mask & tv_overscan);
+wire de_now = (px < 8'(H_ACT)) && (py < v_act_eff);
+wire de_act = de_now;
+
 
 /* ONE-CYCLE SYNC PULSES, PLACED THREE DOTS BEFORE THEY LEAVE THE CORE.
  *
@@ -410,7 +422,9 @@ end
  * the picture, since DE is low and RGB is forced to zero there, but it is not
  * an address the RAM has and it should not be presented as one). */
 wire [6:0] src_x = (ha < 8'(H_ACT)) ? ha[6:0] : 7'd0;
-wire [6:0] src_y = (va < 8'(V_ACT)) ? va[6:0] : 7'd0;
+wire [7:0] src_y_eff = py + v_crop_eff;
+wire [6:0] src_y     = (py < v_act_eff) ? src_y_eff[6:0] : 7'd0;
+
 
 logic [7:0]  rd_index;
 logic [23:0] pal_rgb;
@@ -443,19 +457,23 @@ always_ff @(posedge clk_pix) begin
     else if (ce) begin
         /* stage 3: the pixel whose address went out three enables ago.
          *
-         * RGB IS ZERO WHENEVER DE IS LOW (2026-10-28). The platform's rule, from
-         * sim/tb_video.cpp: "a nonzero word outside the picture is either a held
-         * colour or an end-of-line command (a scaler-slot switch request), and
-         * neither belongs on this link." This module used to put the palette's
-         * answer on the pins for the whole line, blanking included -- 37 dots of
-         * command words per line to a scaler that reads them as instructions.
-         * The pair is registered together, so `de_2` is the level `video_de` is
-         * about to take and the colour that goes with it.
+         * RGB IS ZERO WHENEVER DE IS LOW, EXCEPT FOR THE SCALER-SLOT REQUEST.
+         * The platform's rule: RGB must be zero while DE is low unless the
+         * frame feature bits or the end-of-line bits are in use. In TV mode
+         * the blanking word is 24'h002000 -- endline[23:13] = 1 (slot 1),
+         * endline[12:3] = 0 (reserved), endline[2:0] = 000 (Set Scaler Slot)
+         * -- which is how the scaler is told to use the 128x100 32:25 mode.
+         * During the VS pulse the word is 0 because those bits are the frame
+         * feature field, not an end-of-line command. The pair is registered
+         * together, so `de_2` is the level `video_de` is about to take and the
+         * colour that goes with it.
          */
-        video_rgb <= !de_2    ? 24'h00_00_00
+        video_rgb <= !de_2    ? (tv_mask && !vs_2 ? 24'h00_20_00
+                                                  : 24'h00_00_00)
                               : {pal_rgb[23:19], 3'b000,
                                  pal_rgb[15:10], 2'b00,
                                  pal_rgb[7:3],   3'b000};
+
         video_de  <= de_2;
         video_hs  <= hs_2;
         video_vs  <= vs_2;
