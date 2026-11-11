@@ -194,6 +194,14 @@ module gt_video #(
     input  logic        frame_sync, // console vsync level (vsync_nmi); the
                                     // rising edge is the frame boundary
 
+    /* TV MASK, from pocket/interact.json via core_top. The console's picture
+     * is 128 lines, but a real television only showed the middle 100: rows
+     * 0..13 and 114..127 are overscan. With this bit set, those rows carry no
+     * active data, so the scaler captures a 128x100 window and the rows arrive
+     * as black border. The raster, HS and VS do not move -- the scaler must
+     * keep locking to the same 250-line, 60 Hz frame. */
+    input  logic        tv_mask,
+
     // ---- APF video ------------------------------------------------------
     output logic [23:0] video_rgb,
     output logic        video_de,
@@ -334,6 +342,14 @@ wire [7:0] py = va - 8'(V_OFF);
 
 wire de_now = (px < 8'(H_ACT)) && (py < 8'(V_ACT));
 
+/* THE 14-ROW OVERSCAN BANDS (2026-11-11). `py` is the picture row the
+ * lookahead address belongs to, so gating de_now here keeps the mask aligned
+ * with the three-stage output pipeline below. Only DE is lowered; RGB is
+ * already forced to zero wherever DE is low, and HS/VS stay exactly where the
+ * scaler expects them. Rows 14..113 remain: 100 lines, 128x100. */
+wire tv_overscan = (py < 8'd14) || (py > 8'd113);
+wire de_act      = de_now & ~(tv_mask & tv_overscan);
+
 /* ONE-CYCLE SYNC PULSES, PLACED THREE DOTS BEFORE THEY LEAVE THE CORE.
  *
  * HS goes out on dot H_TOTAL-2 of every line and VS on dot H_TOTAL-6 of the
@@ -445,7 +461,7 @@ always_ff @(posedge clk_pix) begin
         video_vs  <= vs_2;
 
         de_2 <= de_1;  hs_2 <= hs_1;  vs_2 <= vs_1;
-        de_1 <= de_now; hs_1 <= hs_now; vs_1 <= vs_now;
+        de_1 <= de_act; hs_1 <= hs_now; vs_1 <= vs_now;
     end
 end
 

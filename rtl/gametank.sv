@@ -119,6 +119,11 @@ module gametank
     // section). This is a level, not an edge.
     input  logic        pause,
 
+    /* The Pocket's TV-mask checkbox (pocket/interact.json -> core_top). One
+     * bit, quasi-static: set blanks rows 0..13 and 114..127 in rtl/gt_video.sv,
+     * leaving the console's 128x100 TV-safe window. */
+    input  logic        tv_mask,
+
     // gamepads (active high: 0=Right 1=Left 2=Down 3=Up 4=A 5=B 6=C 7=Start)
     input  logic [7:0]  joy1,
     input  logic [7:0]  joy2,
@@ -1092,6 +1097,7 @@ gt_video video
     .pic_y      (pic_y),
     .pic_index  (pic_index),
     .frame_sync (vsync_nmi),
+    .tv_mask    (tv_mask),
 
     .tail_we    (tail_we),
     .tail_addr  (tail_wr),

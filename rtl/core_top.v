@@ -538,6 +538,31 @@ module core_top (
 
   wire external_reset = reset_delay > 0;
 
+  // ------------------------------------------------------ interact: TV mask
+  //
+  // pocket/interact.json exposes one checkbox at BRIDGE address 0x50000000.
+  // The OS reads this word every frame and writes it back after a toggle. It
+  // is stored raw so both directions use the same byte order; any non-zero
+  // value is "checked" (the JSON writes 1), and the power-up value is 1 so the
+  // mask is on before the OS has had a chance to write anything. Persistence
+  // is the APF's: it saves the value by id and writes it back at boot.
+  reg  [31:0] ui_tv_mask = 32'h0000_0001;
+  wire        ui_tv_mask_on = (ui_tv_mask != 32'h0);
+
+  always @(posedge clk_74a) begin
+    if (bridge_wr && bridge_addr == 32'h5000_0000)
+      ui_tv_mask <= bridge_wr_data;
+  end
+
+  // One bit crosses into the pixel domain; two flops are a synchroniser for a
+  // level that only changes when a person toggles the menu.
+  reg  [1:0] tv_mask_sync = 2'b11;
+
+  always @(posedge clk_pix)
+    tv_mask_sync <= {tv_mask_sync[0], ui_tv_mask_on};
+
+  wire tv_mask_pix = tv_mask_sync[1];
+
   wire [31:0] cmd_bridge_rd_data;
 
   // ---- save states ---------------------------------------------------------
@@ -895,6 +920,8 @@ module core_top (
       bridge_rd_data = ss_rd_data;
     else if (sf_rd_hit)
       bridge_rd_data = sf_rd_data;          // gt_save_file's struct window
+    else if (bridge_addr == 32'h5000_0000)
+      bridge_rd_data = ui_tv_mask;          // interact.json's TV mask checkbox
     else if (bridge_addr[31:24] == 8'h02)
       // The Save slot: the cartridge image, or the RAM32K SRAM.
       bridge_rd_data = ram32k_s ? nv_bridge_rdata : ps_bridge_rdata;
@@ -2998,6 +3025,7 @@ module core_top (
       .clk_sys (clk_core),
       .reset   (machine_reset),
       .pause   (machine_pause),
+      .tv_mask (tv_mask_pix),
       .clk_pix (clk_pix),
       .pix_ce  (1'b1),
 
