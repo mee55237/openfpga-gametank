@@ -120,7 +120,7 @@ module gt_video #(
     parameter int H_ACT   = 128,   // picture width
     parameter int V_ACT   = 128,   // picture lines
     parameter int V_ACT_TV = 100,  // TV mode: 100 visible lines (128x100)
-    parameter int V_CROP_TV = 14,  // TV mode: first framebuffer row (14..113)
+    parameter int V_CROP_TV = 12,  // TV mode: first framebuffer row (12..111)
     parameter int H_TOTAL = 150,   // 128 picture + 22 blank: mc64's 15 kHz line
     parameter int V_TOTAL = 250,   // 128 picture + 122 blank: mc64's 250 lines
     parameter int HS_END  = 150,   // HS: one dot, H_TOTAL-2, every line
@@ -199,14 +199,16 @@ module gt_video #(
                                     // rising edge is the frame boundary
 
     /* TV MODE, from pocket/interact.json via core_top. The console's picture
-     * is 128 lines, but a real television only showed the middle 100: rows
-     * 14..113. With this bit set the active window is 100 lines AT THE FRAME
-     * ORIGIN -- scanout line 0 reads framebuffer row 14 -- so the scaler's
-     * 100-line slot 1 capture (128x100, 32:25) starts on the first line of
-     * picture instead of 14 blank ones, and the blanking carries the slot-1
-     * end-of-line request. With it clear the output is the full 128 lines of
-     * slot 0. The raster, HS and VS do not move: the scaler must keep locking
-     * to the same 250-line, 60 Hz frame either way. */
+     * is 128 lines, but the composite scanout only carries rows 0..122, and a
+     * CRT hides the outer rows. The 100-line window is therefore the centered
+     * rows 12..111 (12 cut at the top, 11 at the bottom), not the middle of
+     * the 128-row framebuffer. With this bit set the active window is 100
+     * lines AT THE FRAME ORIGIN -- scanout line 0 reads framebuffer row 12 --
+     * so the scaler's 100-line slot 1 capture (128x100, 32:25) starts on the
+     * first line of picture instead of blank ones, and the blanking carries
+     * the slot-1 end-of-line request. With it clear the output is the full
+     * 128 lines of slot 0. The raster, HS and VS do not move: the scaler must
+     * keep locking to the same 250-line, 60 Hz frame either way. */
     input  logic        tv_mask,
 
     // ---- APF video ------------------------------------------------------
@@ -347,13 +349,17 @@ wire [7:0] va    = wrap3 ? (v_last ? 8'd0 : v + 8'd1) : v;
 wire [7:0] px = ha - 8'(H_OFF);
 wire [7:0] py = va - 8'(V_OFF);
 
-/* THE TV WINDOW (2026-11-11). In TV mode the active picture is 100 lines and
- * it starts at the FRAME ORIGIN, not at row 14: the scaler anchors its capture
- * on VS, so a window that begins with 14 blank lines would be cropped 14 lines
- * at the bottom. Instead the line count changes (100 vs 128) and the frame
- * store read adds V_CROP_TV, so scanout line 0 carries framebuffer row 14 and
- * line 99 carries row 113. The raster, HS and VS do not move -- only DE and
- * the read address -- so the scaler keeps locking to the same 250-line frame. */
+/* THE TV WINDOW (2026-11-11). The console transmits framebuffer rows 0..122;
+ * rows 123..127 never reach its composite output. A CRT hides the outer rows,
+ * so the 100-line window is centered on the transmitted picture: rows 12..111
+ * (12 cut at the top, 11 at the bottom), not the middle of the 128-row
+ * framebuffer. In TV mode the active picture starts at the FRAME ORIGIN: the
+ * scaler anchors its capture on VS, so a window that begins with blank lines
+ * would be cropped at the bottom. The line count changes (100 vs 128) and the
+ * frame store read adds V_CROP_TV, so scanout line 0 carries framebuffer row
+ * 12 and line 99 carries row 111. The raster, HS and VS do not move -- only DE
+ * and the read address -- so the scaler keeps locking to the same 250-line
+ * frame. */
 wire [7:0] v_act_eff  = tv_mask ? 8'(V_ACT_TV)  : 8'(V_ACT);
 wire [7:0] v_crop_eff = tv_mask ? 8'(V_CROP_TV) : 8'd0;
 
