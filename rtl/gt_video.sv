@@ -461,12 +461,13 @@ always_ff @(posedge clk_pix) begin
          * the blanking word is 24'h002000 -- endline[23:13] = 1 (slot 1),
          * endline[12:3] = 0 (reserved), endline[2:0] = 000 (Set Scaler Slot)
          * -- which is how the scaler is told to use the 128x100 32:25 mode.
-         * During the VS pulse the word is 0 because those bits are the frame
-         * feature field, not an end-of-line command. The pair is registered
-         * together, so `de_2` is the level `video_de` is about to take and the
-         * colour that goes with it.
+         * The word is driven for the one cycle after DE falls, as the stock
+         * core_top_template does; the rest of the blanking is zero, and there
+         * is no end-of-line word during VS (those bits are the frame feature
+         * field). The pair is registered together, so `de_2` is the level
+         * `video_de` is about to take and the colour that goes with it.
          */
-        video_rgb <= !de_2    ? (tv_mask && !vs_2 ? 24'h00_20_00
+        video_rgb <= !de_2    ? (tv_mask && video_de ? 24'h00_20_00
                                                   : 24'h00_00_00)
                               : {pal_rgb[23:19], 3'b000,
                                  pal_rgb[15:10], 2'b00,
