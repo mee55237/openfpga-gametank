@@ -117,7 +117,7 @@
 
 module gt_video #(
     // ---- geometry, in pixel periods (mc64_video's parameter names) ----
-        parameter int H_ACT   = 128,   // picture width
+    parameter int H_ACT   = 128,   // picture width
     parameter int V_ACT   = 128,   // picture lines
     parameter int V_ACT_TV = 100,  // TV mode: 100 visible lines (128x100)
     parameter int V_CROP_TV = 14,  // TV mode: first framebuffer row (14..113)
@@ -208,7 +208,6 @@ module gt_video #(
      * slot 0. The raster, HS and VS do not move: the scaler must keep locking
      * to the same 250-line, 60 Hz frame either way. */
     input  logic        tv_mask,
-
 
     // ---- APF video ------------------------------------------------------
     output logic [23:0] video_rgb,
@@ -424,7 +423,6 @@ end
 wire [6:0] src_x = (ha < 8'(H_ACT)) ? ha[6:0] : 7'd0;
 wire [7:0] src_y_eff = py + v_crop_eff;
 wire [6:0] src_y     = (py < v_act_eff) ? src_y_eff[6:0] : 7'd0;
-
 
 logic [7:0]  rd_index;
 logic [23:0] pal_rgb;
