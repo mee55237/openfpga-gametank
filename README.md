@@ -2,7 +2,6 @@
 Gametank for the Analogue Pocket
 
 The GameTank is an 8-bit game console based on the W65C02S, a 6502-family CPU from Western Design Center. It has a 128×100 pixel display with 200 unique colors -ΛERIF°RM (https://wiki.gametank.zone/) -Clyde
-https://gametank.zone/
 
 <p align="center">
   <table align="center">
