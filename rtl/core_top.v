@@ -3234,12 +3234,14 @@ module core_top (
   //
   //   joy1[7] Start   <- Start        joy1[3] Up    <- Up
   //   joy1[6] C       <- X or Y       joy1[2] Down  <- Down
-  //   joy1[5] B       <- B            joy1[1] Left  <- Left
-  //   joy1[4] A       <- A            joy1[0] Right <- Right
+  //   joy1[5] B       <- A            joy1[1] Left  <- Left
+  //   joy1[4] A       <- B            joy1[0] Right <- Right
+  //
+  // A and B are swapped here, in RTL, not in pocket/input.json.
   assign joy1 = { cont1_key[15],                 // Start
                   cont1_key[6] | cont1_key[7],   // C (X or Y)
-                  cont1_key[5],                  // B
-                  cont1_key[4],                  // A
+                  cont1_key[4],                  // B <- Pocket A
+                  cont1_key[5],                  // A <- Pocket B
                   cont1_key[0],                  // Up
                   cont1_key[1],                  // Down
                   cont1_key[2],                  // Left
@@ -3247,8 +3249,8 @@ module core_top (
 
   assign joy2 = { cont2_key[15],
                   cont2_key[6] | cont2_key[7],
-                  cont2_key[5],
-                  cont2_key[4],
+                  cont2_key[4],                  // B <- Pocket A
+                  cont2_key[5],                  // A <- Pocket B
                   cont2_key[0],
                   cont2_key[1],
                   cont2_key[2],
